@@ -21,7 +21,8 @@
 #define RELAY_ID 1
 
 // Runner 없이 Gateway-Relay 통신을 시험할 때 true로 설정한다.
-#define TEST_DUMMY_MODE true
+#define TEST_DUMMY_MODE false
+#define DUMMY_GATEWAY_RECEIVE_MODE true
 
 #define LORA_FREQUENCY 915E6
 #define LORA_SYNC_WORD 0x33
@@ -35,6 +36,7 @@
 #define PHASE_GUARD_MS 500UL
 #define SEND_NOW_TIMEOUT_MS 10000UL
 #define MAX_BUFFER_SIZE 10
+#define MAX_RUNNERS 20
 #define FORWARD_INTERVAL_MS 400UL
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -57,6 +59,7 @@ struct RunnerData {
   String lng;
   int pace;
   int battery;
+  char status;
   int seq;
   int rssi;
   float snr;
@@ -89,7 +92,7 @@ void sendBeaconPacket();
 bool isDuplicateRunnerPacket(int cycleId, int runnerId, int seq);
 void addRunnerDataToBuffer(int cycleId, int relayId, int runnerId,
                            String lat, String lng, int pace, int battery,
-                           int seq, int rssi, float snr);
+                           char status, int seq, int rssi, float snr);
 void handleRunnerPacket(String msg, int rssi, float snr);
 void forwardBufferedPacketsToGateway();
 void sendDonePacket();
@@ -99,6 +102,15 @@ void clearRelayBuffer();
 void changeState(RelayState nextState);
 const char *stateName(RelayState state);
 void updateOLED();
+bool emergencyForwarded[MAX_RUNNERS + 1] = {false};
+void sendEmergencyPacketToGateway(int cycleId, int runnerId,
+                                  String lat, String lng,
+                                  int pace, int battery,
+                                  char status, int seq,
+                                  int rssi, float snr);
+
+void dummyGatewayReceive(String msg);
+void dummyGatewayHandleDone(String msg);
 
 void setup() {
   Serial.begin(115200);
@@ -271,6 +283,11 @@ void sendLoRaMessage(String msg) {
   if (LoRa.endPacket() == 1) {
     Serial.print("[TX] ");
     Serial.println(msg);
+
+    if (DUMMY_GATEWAY_RECEIVE_MODE) {
+      dummyGatewayReceive(msg);
+    }
+
   } else {
     Serial.println("[TX][ERROR] LoRa transmission failed");
   }
@@ -431,7 +448,7 @@ bool isDuplicateRunnerPacket(int cycleId, int runnerId, int seq) {
 
 void addRunnerDataToBuffer(int cycleId, int relayId, int runnerId,
                            String lat, String lng, int pace, int battery,
-                           int seq, int rssi, float snr) {
+                           char status,int seq, int rssi, float snr) {
   if (bufferCount >= MAX_BUFFER_SIZE) {
     Serial.println("[BUFFER][WARN] Buffer full. Runner packet dropped.");
     return;
@@ -453,6 +470,7 @@ void addRunnerDataToBuffer(int cycleId, int relayId, int runnerId,
   data.lng = lng;
   data.pace = pace;
   data.battery = battery;
+  data.status = status;
   data.seq = seq;
   data.rssi = rssi;
   data.snr = snr;
@@ -482,7 +500,11 @@ void handleRunnerPacket(String msg, int rssi, float snr) {
       getField(msg, 6).length() == 0 ||
       getField(msg, 7).length() == 0 ||
       getField(msg, 8).length() == 0 ||
-      getField(msg, 10).length() != 0) {
+      getField(msg, 9).length() == 0 ||
+      getField(msg, 10).length() == 0 ||
+      getField(msg, 11).length() == 0 ||
+      getField(msg, 12).length() == 0 ||
+      getField(msg, 13).length() != 0) {
     Serial.println("[RUNNER][ERROR] Invalid CSV format");
     return;
   }
@@ -494,8 +516,12 @@ void handleRunnerPacket(String msg, int rssi, float snr) {
   String lng = getField(msg, 5);
   int pace = getField(msg, 6).toInt();
   int battery = getField(msg, 7).toInt();
-  int seq = getField(msg, 8).toInt();
-  String gpsValidField = getField(msg, 9);
+  String statusField = getField(msg, 8);
+  char status = statusField.charAt(0);
+  int seq = getField(msg, 9).toInt();
+  int rssi = getField(msg, 10).toInt();
+  float snr = getField(msg, 11).toFloat();
+  String gpsValidField = getField(msg, 12);
 
   if (packetCycleId != activeCycleId) {
     Serial.print("[RUNNER] Dropped: cycle ");
@@ -513,8 +539,13 @@ void handleRunnerPacket(String msg, int rssi, float snr) {
     return;
   }
 
-  if (runnerId <= 0 || seq < 0) {
+  if (runnerId <= 0 || runnerId > MAX_RUNNERS || seq < 0) {
     Serial.println("[RUNNER][ERROR] Invalid runner_id or seq");
+    return;
+  }
+
+  if (status != 'M' && status != 'E') {
+    Serial.println("[RUNNER][ERROR] Invalid status");
     return;
   }
 
@@ -523,8 +554,58 @@ void handleRunnerPacket(String msg, int rssi, float snr) {
     Serial.println(gpsValidField);
   }
 
+  if(status == 'E' && !emergencyForwarded[runnerId]){
+    Serial.print("[EMERGENCY] First E from runner ");
+    Serial.println(runnerId);
+
+    sendEmergencyPacketToGateway(packetCycleId, runnerId, lat, lng,
+                                 pace, battery, status, seq, rssi, snr);
+
+    emergencyForwarded[runnerId] = true;
+
+    return;
+  }
+
+  if (status == 'M') {
+    emergencyForwarded[runnerId] = false;
+  }
+
   addRunnerDataToBuffer(packetCycleId, RELAY_ID, runnerId, lat, lng,
-                        pace, battery, seq, rssi, snr);
+                        pace, battery, status, seq, rssi, snr);
+}
+
+void sendEmergencyPacketToGateway(int cycleId, int runnerId,
+                                  String lat, String lng,
+                                  int pace, int battery,
+                                  char status, int seq,
+                                  int rssi, float snr) {
+  String message = "EMERGENCY,";
+  message += String(cycleId);
+  message += ",";
+  message += String(RELAY_ID);
+  message += ",";
+  message += String(runnerId);
+  message += ",";
+  message += lat;
+  message += ",";
+  message += lng;
+  message += ",";
+  message += String(pace);
+  message += ",";
+  message += String(battery);
+  message += ",";
+  message += String(status);
+  message += ",";
+  message += String(seq);
+  message += ",";
+  message += String(rssi);
+  message += ",";
+  message += String(snr, 2);
+
+  Serial.print("[EMERGENCY][TX] ");
+  Serial.println(message);
+
+  sendLoRaMessage(message);
 }
 
 void forwardBufferedPacketsToGateway() {
@@ -551,6 +632,8 @@ void forwardBufferedPacketsToGateway() {
     message += String(data.pace);
     message += ",";
     message += String(data.battery);
+    message += ",";
+    message += String(data.status);
     message += ",";
     message += String(data.seq);
     message += ",";
@@ -639,7 +722,131 @@ void addDummyRunnerData() {
   Serial.println("[DUMMY] Adding one test RunnerData item");
   addRunnerDataToBuffer(activeCycleId, RELAY_ID, dummyRunnerId,
                         dummyLat, dummyLng, dummyPace, dummyBattery,
-                        dummySeq, -70, 8.0);
+                        'M', dummySeq, -70, 8.0);
+}
+
+void dummyGatewayReceive(String msg) {
+  if (!DUMMY_GATEWAY_RECEIVE_MODE) {
+    return;
+  }
+
+  Serial.println();
+  Serial.println("========== [DUMMY GATEWAY RX] ==========");
+
+  if (startsWithPacket(msg, "EMERGENCY")) {
+    Serial.println("🚨🚨🚨 [DUMMY GATEWAY] EMERGENCY RECEIVED 🚨🚨🚨");
+    Serial.print("[DUMMY GATEWAY][EMERGENCY] ");
+    Serial.println(msg);
+
+    int cycleId = getField(msg, 1).toInt();
+    int relayId = getField(msg, 2).toInt();
+    int runnerId = getField(msg, 3).toInt();
+    String lat = getField(msg, 4);
+    String lng = getField(msg, 5);
+    int pace = getField(msg, 6).toInt();
+    int battery = getField(msg, 7).toInt();
+    String status = getField(msg, 8);
+    int seq = getField(msg, 9).toInt();
+
+    Serial.print("cycle=");
+    Serial.print(cycleId);
+    Serial.print(", relay=");
+    Serial.print(relayId);
+    Serial.print(", runner=");
+    Serial.print(runnerId);
+    Serial.print(", status=");
+    Serial.print(status);
+    Serial.print(", seq=");
+    Serial.print(seq);
+    Serial.print(", lat=");
+    Serial.print(lat);
+    Serial.print(", lng=");
+    Serial.print(lng);
+    Serial.print(", pace=");
+    Serial.print(pace);
+    Serial.print(", battery=");
+    Serial.println(battery);
+  }
+
+  else if (startsWithPacket(msg, "FORWARD")) {
+    Serial.println("[DUMMY GATEWAY] FORWARD RECEIVED");
+    Serial.print("[DUMMY GATEWAY][FORWARD] ");
+    Serial.println(msg);
+
+    int cycleId = getField(msg, 1).toInt();
+    int relayId = getField(msg, 2).toInt();
+    int runnerId = getField(msg, 3).toInt();
+    String lat = getField(msg, 4);
+    String lng = getField(msg, 5);
+    int pace = getField(msg, 6).toInt();
+    int battery = getField(msg, 7).toInt();
+    String status = getField(msg, 8);
+    int seq = getField(msg, 9).toInt();
+
+    Serial.print("cycle=");
+    Serial.print(cycleId);
+    Serial.print(", relay=");
+    Serial.print(relayId);
+    Serial.print(", runner=");
+    Serial.print(runnerId);
+    Serial.print(", status=");
+    Serial.print(status);
+    Serial.print(", seq=");
+    Serial.print(seq);
+    Serial.print(", lat=");
+    Serial.print(lat);
+    Serial.print(", lng=");
+    Serial.print(lng);
+    Serial.print(", pace=");
+    Serial.print(pace);
+    Serial.print(", battery=");
+    Serial.println(battery);
+  }
+
+  else if (startsWithPacket(msg, "DONE")) {
+    Serial.println("[DUMMY GATEWAY] DONE RECEIVED");
+    Serial.print("[DUMMY GATEWAY][DONE] ");
+    Serial.println(msg);
+
+    dummyGatewayHandleDone(msg);
+  }
+
+  else if (startsWithPacket(msg, "BEACON")) {
+    Serial.println("[DUMMY GATEWAY] BEACON observed");
+    Serial.print("[DUMMY GATEWAY][BEACON] ");
+    Serial.println(msg);
+  }
+
+  else {
+    Serial.println("[DUMMY GATEWAY] UNKNOWN PACKET");
+    Serial.println(msg);
+  }
+
+  Serial.println("========================================");
+  Serial.println();
+}
+
+void dummyGatewayHandleDone(String msg) {
+  // DONE,cycle_id,relay_id,count
+  int cycleId = getField(msg, 1).toInt();
+  int relayId = getField(msg, 2).toInt();
+  int count = getField(msg, 3).toInt();
+
+  Serial.print("[DUMMY GATEWAY] cycle=");
+  Serial.print(cycleId);
+  Serial.print(", relay=");
+  Serial.print(relayId);
+  Serial.print(", forwarded_count=");
+  Serial.println(count);
+
+  if (relayId == 1) {
+    Serial.println("[DUMMY GATEWAY] Relay1 finished.");
+    Serial.println("[DUMMY GATEWAY] In real gateway, SEND_NOW would be sent to Relay2.");
+  }
+
+  if (relayId == 2) {
+    Serial.println("[DUMMY GATEWAY] Relay2 finished. Cycle complete.");
+  }
 }
 
 void clearRelayBuffer() {
@@ -651,6 +858,7 @@ void clearRelayBuffer() {
     relayBuffer[i].lng = "";
     relayBuffer[i].pace = 0;
     relayBuffer[i].battery = 0;
+    relayBuffer[i].status = 'M';
     relayBuffer[i].seq = -1;
     relayBuffer[i].rssi = -999;
     relayBuffer[i].snr = -999.0;
