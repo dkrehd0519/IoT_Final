@@ -5,17 +5,21 @@
 #include <XPowersLib.h>
 
 #define LORA_CS    18
-#define LORA_DIO1  26
+#define LORA_DIO1  33
 #define LORA_RST   23
+#define LORA_BUSY 32
+#define LORA_SCK 5
+#define LORA_MISO 19
+#define LORA_MOSI 27
 
-SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST);
+SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
 #define GPS_RX 34
 #define GPS_TX 12
 #define GPS_BAUD 9600 // Setting a rate to communicate with the GPS module. 
 
 #define RUNNER_ID 1  // Set a unique ID for this runner.
-#define LORA_FREQUENCY 923.0
+#define LORA_FREQUENCY 915.0
 #define LORA_SYNC_WORD 0x33
 #define LORA_TX_POWER 17
 #define LORA_SPREADING_FACTOR 7
@@ -86,6 +90,8 @@ int selectedCandidateIndex = -1;
 int selectedRelayId = -1;
 int selectedRunnerCount = 0;
 int selectedRunnerSlotMs = 0;
+int selectedRelayRssi = 0;
+float selectedRelaySnr = 0.0;
 
 double lastLat = DUMMY_LAT;
 double lastLng = DUMMY_LNG;
@@ -140,6 +146,7 @@ void injectDummyBeaconIfNeeded(); // for testing without actual Relay/BEACON, ge
 
 void setup(){
     Serial.begin(115200);
+    SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
     delay(1000);
 
     Serial.println();
@@ -208,7 +215,7 @@ void setup(){
         Serial.println(state);
     }
 
-    Serial.println("[LoRa] 923 MHz, SF7, BW125 kHz, CR4/5, SyncWord 0x33, CRC ON");
+    Serial.println("[LoRa] 915 MHz, SF7, BW125 kHz, CR4/5, SyncWord 0x33, CRC ON");
 
     // Initialize beacon candidates and change to WAIT_BEACON state
     resetBeaconCandidates();
@@ -287,7 +294,7 @@ void loop(){
     // Always read GPS data to keep location updated, even when not sending status.
     //so that the latest position is available when it's time to send.
     updateGPS();
-    // updateSOSButton();
+    updateSOSButton();
 
     // testing function to simulate receiving BEACON packets without actual Relay hardware.
     injectDummyBeaconIfNeeded();
@@ -333,6 +340,8 @@ void loop(){
                 selectedRelayId = selected.relayId;
                 selectedRunnerCount = selected.runnerCount;
                 selectedRunnerSlotMs = selected.runnerSlotMs;
+                selectedRelayRssi = selected.rssi;
+                selectedRelaySnr = selected.snr;
 
                 Serial.print("[SELECT] Relay ");
                 Serial.print(selectedRelayId);
@@ -592,7 +601,7 @@ void updateSOSButton() {
   if(currentButtonState == SOS_ACTIVE_LEVEL && lastButtonState != SOS_ACTIVE_LEVEL){
     // emergencyMode = true; // for mode1, 2
 
-    // for mode 3
+    // for mode 3 (toggle)
     emergencyMode = !emergencyMode; 
     if(emergencyMode){
       Serial.println("[SOS] Emergency activated");
@@ -817,7 +826,7 @@ void sendRunnerStatus(){
 
   int pace = calculatePace();
   int battery = readBatteryPercent();
-  // char status = getRunnerStatus();
+  char status = getRunnerStatus();
 
   // RUNNER,cycle_id,runner_id,target_relay_id,lat,lng,pace,battery,seq,gps_valid
   String message = "RUNNER,";
@@ -835,10 +844,14 @@ void sendRunnerStatus(){
   message += ",";
   message += String(battery);
   message += ",";
-  // message += String(status);
-  // message += ",";
+  message += String(status);
+  message += ",";
   message += String(seq);
   message += ",";
+  message += ",";
+  message += String(selectedRelayRssi);
+  message += ",";
+  message += String(selectedRelaySnr, 2);
   message += gpsValid ? "1" : "0";
 
   Serial.print("[GPS] valid=");
@@ -855,8 +868,12 @@ void sendRunnerStatus(){
   Serial.print(pace);
   Serial.print(", battery=");
   Serial.print(battery);
-  // Serial.print(", status=");
-  // Serial.print(status);
+  Serial.print(", status=");
+  Serial.print(status);
+  Serial.print(", relay_rssi=");
+  Serial.print(selectedRelayRssi);
+  Serial.print(", relay_snr=");
+  Serial.print(selectedRelaySnr, 2);
 
   Serial.println();
 
