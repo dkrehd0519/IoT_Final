@@ -48,19 +48,32 @@
 #define LORA_CODING_RATE_DENOMINATOR 5
 #define LORA_PREAMBLE_LENGTH 8
 
+const long CHANNEL_FREQ_HZ[] = {
+  915000000,
+  916000000,
+  917000000,
+  918000000,
+  919000000,
+};
+
 #define RELAY_BEACON_SLOT_MS 500UL
 #define PHASE_GUARD_MS 500UL
 #define SEND_NOW_TIMEOUT_MS 10000UL
 #define TOTAL_RUNNERS 3
 #define GROUP_COVERAGE_M 10000.0f
 #define RELAY_INTERVAL_M 500.0f
-#define RELAYS_PER_GROUP 2
+#define TOTAL_RELAYS 40
+#define CHANNEL_GROUP_COUNT 5
+#define RELAYS_PER_CHANNEL_GROUP \
+  ((TOTAL_RELAYS + CHANNEL_GROUP_COUNT - 1) / CHANNEL_GROUP_COUNT)
 #define RELAY_MAX_COUNT 2
 #define ACTIVE_TIMEOUT_MS 30000UL
 #define MAX_ACTIVE_RUNNERS 300
 #define MAX_BUFFER_SIZE MAX_ACTIVE_RUNNERS
 #define FORWARD_INTERVAL_MS 400UL
 #define EMERGENCY_GATEWAY_FORWARD_MAX 3
+#define BATCH_FORWARD_MODE true
+#define BATCH_MAX_ITEMS 5
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool oledReady = false;
@@ -127,6 +140,9 @@ bool startsWithPacket(String msg, String type);
 String getField(String msg, int index);
 void parseSchedule(String msg);
 void sendBeacon();
+int getRelayGroupIndexByRelayId(int relayId);
+int getRelaySlotInChannel(int relayId);
+long getRelayChannelFrequencyHz();
 bool isDuplicateRunnerPacket(int cycleId, int runnerId, int seq);
 void addRunnerDataToBuffer(int cycleId, int relayId, int runnerId,
                            String lat, String lng, int pace, int battery,
@@ -141,6 +157,8 @@ void handleHandoverPacket(String msg); // HANDOVER 패킷 처리 및 기존 rela
 bool isEmergencyDataPacket(String msg);
 void handleReceivedPacket(String msg, int rssi, float snr); // 수신 패킷 종류에 따라 처리 함수로 분기
 void forwardBufferedPacketsToGateway();
+void forwardBufferedPacketsOneByOneToGateway();
+void forwardBufferedPacketsBatchToGateway();
 void sendDonePacket();
 void handleSendNowPacket(String msg);
 void startSelfTestCycle();
@@ -199,7 +217,14 @@ void setup(){
   }
 
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if(!LoRa.begin(LORA_FREQUENCY)){
+  long relayFrequency = getRelayChannelFrequencyHz();
+
+  Serial.print("[CHANNEL] Relay group=");
+  Serial.print(getRelayGroupIndexByRelayId(RELAY_ID) + 1);
+  Serial.print(", frequency=");
+  Serial.println(relayFrequency);
+
+  if(!LoRa.begin(relayFrequency)){
     Serial.println("[ERROR] LoRa initialization failed. Check wiring and board pins.");
     showOLED("LoRa ERROR", "Relay: " + String(RELAY_ID),
              "Check pins", "Relay stopped");
@@ -442,15 +467,15 @@ void parseSchedule(String msg){
   pendingSendNow = false;
   scheduleReceivedTime = millis();
 
-  // Relay ID가 커져도 Group 안에서는 0~19 beacon slot을 사용한다.
+  // 같은 channel index 안에서는 relayId 간격별 slot을 사용한다.
   unsigned long relaySlotIndex =
-     (unsigned long)((RELAY_ID - 1)% RELAYS_PER_GROUP);
+     (unsigned long)getRelaySlotInChannel(RELAY_ID);
   beaconSendTime =
       scheduleReceivedTime + relaySlotIndex * RELAY_BEACON_SLOT_MS;
 
   // 모든 Relay beacon slot과 guard 이후 Runner uplink phase가 시작된다.
   unsigned long beaconPhaseMs =
-     (unsigned long)RELAYS_PER_GROUP * RELAY_BEACON_SLOT_MS;
+     (unsigned long)RELAYS_PER_CHANNEL_GROUP * RELAY_BEACON_SLOT_MS;
   unsigned long runnerPhaseMs =
      (unsigned long)RELAY_MAX_COUNT *(unsigned long)runnerSlotMs;
   runnerPhaseEndTime =
@@ -470,6 +495,29 @@ void parseSchedule(String msg){
   Serial.println(runnerPhaseEndTime);
 
   changeState(SEND_BEACON);
+}
+
+int getRelayGroupIndexByRelayId(int relayId){
+  return (relayId - 1) % CHANNEL_GROUP_COUNT;
+}
+
+int getRelaySlotInChannel(int relayId){
+  return (relayId - 1) / CHANNEL_GROUP_COUNT;
+}
+
+long getRelayChannelFrequencyHz(){
+  int groupIndex = getRelayGroupIndexByRelayId(RELAY_ID);
+  int channelCount = sizeof(CHANNEL_FREQ_HZ) / sizeof(CHANNEL_FREQ_HZ[0]);
+
+  if(groupIndex < 0){
+    groupIndex = 0;
+  }
+
+  if(groupIndex >= channelCount){
+    groupIndex = channelCount - 1;
+  }
+
+  return CHANNEL_FREQ_HZ[groupIndex];
 }
 
 void sendBeacon(){
@@ -493,7 +541,7 @@ void sendBeacon(){
   Serial.print("/");
   Serial.print(RELAY_MAX_COUNT);
   Serial.print(", slot=");
-  Serial.println((RELAY_ID - 1)% RELAYS_PER_GROUP);
+  Serial.println(getRelaySlotInChannel(RELAY_ID));
   sendLoRaMessage(message);
 }
 
@@ -863,9 +911,17 @@ void sendEmergencyPacketToGateway(int cycleId, int runnerId,
 }
 
 void forwardBufferedPacketsToGateway(){
+  if(BATCH_FORWARD_MODE){
+    forwardBufferedPacketsBatchToGateway();
+  }else{
+    forwardBufferedPacketsOneByOneToGateway();
+  }
+}
+
+void forwardBufferedPacketsOneByOneToGateway(){
   Serial.print("[FORWARD] Sending ");
   Serial.print(bufferCount);
-  Serial.println(" buffered packet(s)to Gateway");
+  Serial.println(" buffered packet(s) to Gateway");
   updateOLED();
 
   for(int i = 0; i < bufferCount; i++){
@@ -896,6 +952,59 @@ void forwardBufferedPacketsToGateway(){
     sendLoRaMessage(message);
 
     // 연속 송신으로 인한 Gateway 수신 누락 가능성을 줄인다.
+    delay(FORWARD_INTERVAL_MS);
+  }
+}
+
+void forwardBufferedPacketsBatchToGateway(){
+  Serial.print("[BATCH] Sending ");
+  Serial.print(bufferCount);
+  Serial.println(" buffered runner packet(s) in batch mode");
+  updateOLED();
+
+  int index = 0;
+
+  while(index < bufferCount){
+    int batchStart = index;
+    int batchCount = 0;
+    String entries = "";
+
+    while(index < bufferCount && batchCount < BATCH_MAX_ITEMS){
+      RunnerData &data = relayBuffer[index];
+
+      if(batchCount > 0){
+        entries += ";";
+      }
+
+      entries += String(data.runnerId);
+      entries += "|";
+      entries += data.lat;
+      entries += "|";
+      entries += data.lng;
+      entries += "|";
+      entries += String(data.pace);
+      entries += "|";
+      entries += String(data.battery);
+      entries += "|";
+      entries += String(data.seq);
+
+      batchCount++;
+      index++;
+    }
+
+    String message = "BATCH,";
+    message += String(relayBuffer[batchStart].cycleId);
+    message += ",";
+    message += String(RELAY_ID);
+    message += ",";
+    message += String(batchCount);
+    message += ",";
+    message += entries;
+
+    Serial.print("[BATCH][TX] ");
+    Serial.println(message);
+
+    sendLoRaMessage(message);
     delay(FORWARD_INTERVAL_MS);
   }
 }
@@ -960,7 +1069,7 @@ void startSelfTestCycle(){
 
   clearRelayBuffer();
   activeCycleId = selfTestCycleId++;
-  relayCount = RELAYS_PER_GROUP;
+  relayCount = RELAYS_PER_CHANNEL_GROUP;
   runnerCount = TOTAL_RUNNERS;
   runnerSlotMs = SELF_TEST_RUNNER_SLOT_MS;
   pendingSendNow = false;
@@ -973,7 +1082,7 @@ void startSelfTestCycle(){
   beaconSendTime = millis();
 
   unsigned long beaconPhaseMs =
-      (unsigned long)RELAYS_PER_GROUP * RELAY_BEACON_SLOT_MS;
+      (unsigned long)RELAYS_PER_CHANNEL_GROUP * RELAY_BEACON_SLOT_MS;
   unsigned long runnerPhaseMs =
       (unsigned long)RELAY_MAX_COUNT * (unsigned long)runnerSlotMs;
   runnerPhaseEndTime =
@@ -1175,6 +1284,26 @@ void selfTestGatewayReceive(String msg){
     Serial.print(pace);
     Serial.print(", battery=");
     Serial.println(battery);
+  }
+
+  else if(startsWithPacket(msg, "BATCH")){
+    Serial.println("[SELF_TEST GATEWAY] BATCH RECEIVED");
+    Serial.print("[SELF_TEST GATEWAY][BATCH] ");
+    Serial.println(msg);
+
+    int cycleId = getField(msg, 1).toInt();
+    int relayId = getField(msg, 2).toInt();
+    int batchCount = getField(msg, 3).toInt();
+    String entries = getField(msg, 4);
+
+    Serial.print("cycle=");
+    Serial.print(cycleId);
+    Serial.print(", relay=");
+    Serial.print(relayId);
+    Serial.print(", batch_count=");
+    Serial.print(batchCount);
+    Serial.print(", entries=");
+    Serial.println(entries);
   }
 
   else if(startsWithPacket(msg, "DONE")){

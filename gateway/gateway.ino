@@ -25,10 +25,23 @@
 #define LORA_CODING_RATE_DENOMINATOR 5
 #define LORA_PREAMBLE_LENGTH 8
 
-#define RELAY_COUNT 2
+const long CHANNEL_FREQ_HZ[] = {
+  915000000,
+  916000000,
+  917000000,
+  918000000,
+  919000000,
+};
+
+#define TOTAL_RELAYS 40
+#define CHANNEL_GROUP_COUNT 5
+#define RELAYS_PER_CHANNEL_GROUP \
+  ((TOTAL_RELAYS + CHANNEL_GROUP_COUNT - 1) / CHANNEL_GROUP_COUNT)
+#define RELAY_COUNT RELAYS_PER_CHANNEL_GROUP
 #define RUNNER_COUNT 3
 #define RUNNER_SLOT_MS 150
 #define MAX_RUNNERS RUNNER_COUNT
+#define GATEWAY_GROUP_INDEX 0
 
 #define RELAY1_ID 1
 #define RELAY2_ID 2
@@ -68,9 +81,12 @@ void sendLoRaMessage(String msg);
 bool receiveLoRaMessage(String &msg, int &rssi, float &snr);
 bool startsWithPacket(String msg, String type);
 String getField(String msg, int index);
+String getDelimitedField(String msg, int index, char delimiter);
+long getGatewayChannelFrequencyHz();
 void sendSchedulePacket();
 void sendRelay2StartPacket();
 void handleForwardPacket(String msg, int rssi, float snr);
+void handleBatchForwardPacket(String msg, int rssi, float snr);
 void handleDonePacket(String msg);
 void changeState(GatewayState nextState);
 const char *stateName(GatewayState state);
@@ -102,7 +118,14 @@ void setup(){
 
   // 보드 버전에 따라 LoRa 핀 수정이 필요할 수 있다.
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if(!LoRa.begin(LORA_FREQUENCY)){
+  long gatewayFrequency = getGatewayChannelFrequencyHz();
+
+  Serial.print("[CHANNEL] Gateway group=");
+  Serial.print(GATEWAY_GROUP_INDEX + 1);
+  Serial.print(", frequency=");
+  Serial.println(gatewayFrequency);
+
+  if(!LoRa.begin(gatewayFrequency)){
     Serial.println("[ERROR] LoRa initialization failed. Check wiring and board pins.");
     showOLED("LoRa ERROR", "Check pins", "Gateway stopped");
 
@@ -141,12 +164,14 @@ void loop(){
     if(receiveLoRaMessage(message, rssi, snr)){
       if(startsWithPacket(message, "EMERGENCY")){
         handleEmergencyPacket(message, rssi, snr);
+      } else if(startsWithPacket(message, "BATCH")){
+        handleBatchForwardPacket(message, rssi, snr);
       } else if(startsWithPacket(message, "FORWARD")){
         handleForwardPacket(message, rssi, snr);
       } else if(startsWithPacket(message, "DONE")){
         handleDonePacket(message);
       } else {
-        Serial.println("[RX] Ignored: expected EMERGENCY, FORWARD or DONE packet");
+        Serial.println("[RX] Ignored: expected EMERGENCY, BATCH, FORWARD or DONE packet");
       }
     }
   }
@@ -289,6 +314,45 @@ String getField(String msg, int index){
   return "";
 }
 
+String getDelimitedField(String msg, int index, char delimiter){
+  if(index < 0){
+    return "";
+  }
+
+  int fieldStart = 0;
+  int currentIndex = 0;
+
+  for(int i = 0; i <= msg.length(); i++){
+    if(i == msg.length() || msg.charAt(i) == delimiter){
+      if(currentIndex == index){
+        String field = msg.substring(fieldStart, i);
+        field.trim();
+        return field;
+      }
+
+      currentIndex++;
+      fieldStart = i + 1;
+    }
+  }
+
+  return "";
+}
+
+long getGatewayChannelFrequencyHz(){
+  int channelCount = sizeof(CHANNEL_FREQ_HZ) / sizeof(CHANNEL_FREQ_HZ[0]);
+  int groupIndex = GATEWAY_GROUP_INDEX;
+
+  if(groupIndex < 0){
+    groupIndex = 0;
+  }
+
+  if(groupIndex >= channelCount){
+    groupIndex = channelCount - 1;
+  }
+
+  return CHANNEL_FREQ_HZ[groupIndex];
+}
+
 void sendSchedulePacket(){
   // SCHEDULE,cycle_id,relay_count,runner_count,runner_slot_ms
   String message = "SCHEDULE,";
@@ -392,6 +456,125 @@ void handleForwardPacket(String msg, int rssi, float snr){
 
   // TODO: 이 지점에서 server HTTP 또는 MQTT publish 함수를 호출할 수 있다.
   updateWaitingOLED();
+}
+
+void handleBatchForwardPacket(String msg, int rssi, float snr){
+  // BATCH,cycle_id,relay_id,batch_count,runnerId|lat|lng|pace|battery|seq;...
+  if(getField(msg, 0)!= "BATCH" ||
+      getField(msg, 1).length()== 0 ||
+      getField(msg, 2).length()== 0 ||
+      getField(msg, 3).length()== 0 ||
+      getField(msg, 4).length()== 0 ||
+      getField(msg, 5).length()!= 0){
+    Serial.println("[BATCH][ERROR] Invalid CSV format");
+    return;
+  }
+
+  unsigned long packetCycleId =(unsigned long)getField(msg, 1).toInt();
+  int relayId = getField(msg, 2).toInt();
+  int batchCount = getField(msg, 3).toInt();
+  String entries = getField(msg, 4);
+
+  if(packetCycleId != cycleId){
+    Serial.print("[BATCH] Ignored: packet cycle ");
+    Serial.print(packetCycleId);
+    Serial.print(" does not match active cycle ");
+    Serial.println(cycleId);
+    return;
+  }
+
+  int expectedRelayId =
+     (currentState == WAIT_RELAY1_DATA)? RELAY1_ID : RELAY2_ID;
+  if(relayId != expectedRelayId){
+    Serial.print("[BATCH] Ignored: expected relay ");
+    Serial.print(expectedRelayId);
+    Serial.print(", received relay ");
+    Serial.println(relayId);
+    return;
+  }
+
+  if(batchCount <= 0){
+    Serial.println("[BATCH][ERROR] Invalid batch_count");
+    return;
+  }
+
+  Serial.println();
+  Serial.print("[BATCH] Received batch from relay ");
+  Serial.print(relayId);
+  Serial.print(", count=");
+  Serial.println(batchCount);
+
+  int parsedCount = 0;
+  int entryStart = 0;
+
+  for(int i = 0; i <= entries.length(); i++){
+    if(i == entries.length() || entries.charAt(i) == ';'){
+      String entry = entries.substring(entryStart, i);
+      entry.trim();
+
+      if(entry.length() > 0){
+        String runnerIdField = getDelimitedField(entry, 0, '|');
+        String latField = getDelimitedField(entry, 1, '|');
+        String lngField = getDelimitedField(entry, 2, '|');
+        String paceField = getDelimitedField(entry, 3, '|');
+        String batteryField = getDelimitedField(entry, 4, '|');
+        String seqField = getDelimitedField(entry, 5, '|');
+
+        if(runnerIdField.length() == 0 ||
+           latField.length() == 0 ||
+           lngField.length() == 0 ||
+           paceField.length() == 0 ||
+           batteryField.length() == 0 ||
+           seqField.length() == 0 ||
+           getDelimitedField(entry, 6, '|').length() != 0){
+          Serial.println("[BATCH][ERROR] Invalid runner entry format");
+        }else{
+          int runnerId = runnerIdField.toInt();
+
+          if(relayId == RELAY1_ID){
+            relay1PacketCount++;
+          } else if(relayId == RELAY2_ID){
+            relay2PacketCount++;
+          }
+
+          Serial.println("[BATCH] Parsed runner data");
+          Serial.print("  cycle_id: ");
+          Serial.println(packetCycleId);
+          Serial.print("  relay_id: ");
+          Serial.println(relayId);
+          Serial.print("  runner_id: ");
+          Serial.println(runnerId);
+          Serial.print("  lat/lng: ");
+          Serial.print(latField);
+          Serial.print(", ");
+          Serial.println(lngField);
+          Serial.print("  pace/battery/seq: ");
+          Serial.print(paceField);
+          Serial.print(" / ");
+          Serial.print(batteryField);
+          Serial.print(" / ");
+          Serial.println(seqField);
+          Serial.print("  Relay-to-Gateway RSSI/SNR: ");
+          Serial.print(rssi);
+          Serial.print(" dBm / ");
+          Serial.print(snr, 2);
+          Serial.println(" dB");
+
+          updateWaitingOLED();
+          parsedCount++;
+        }
+      }
+
+      entryStart = i + 1;
+    }
+  }
+
+  if(parsedCount != batchCount){
+    Serial.print("[BATCH][WARN] batch_count=");
+    Serial.print(batchCount);
+    Serial.print(", parsed_count=");
+    Serial.println(parsedCount);
+  }
 }
 
 void handleDonePacket(String msg){

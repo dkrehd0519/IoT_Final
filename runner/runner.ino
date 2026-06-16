@@ -27,21 +27,36 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 #define LORA_CODING_RATE_DENOMINATOR 5
 #define LORA_PREAMBLE_LENGTH 8
 
+const float CHANNEL_FREQ_MHZ[] = {
+  915.0,
+  916.0,
+  917.0,
+  918.0,
+  919.0,
+};
+
 #define TOTAL_RUNNERS 3
 #define GROUP_COVERAGE_M 3000.0f 
 #define RELAY_INTERVAL_M 1500.0f
-#define RELAYS_PER_GROUP 2
+#define TOTAL_RELAYS 40
+#define CHANNEL_GROUP_COUNT 5
+#define RELAYS_PER_CHANNEL_GROUP \
+ ((TOTAL_RELAYS + CHANNEL_GROUP_COUNT - 1) / CHANNEL_GROUP_COUNT)
 #define RELAY_MAX_COUNT 2
 #define RELAY_BEACON_SLOT_MS 500UL
 #define BEACON_COLLECTION_MS \
- ((unsigned long)RELAYS_PER_GROUP * RELAY_BEACON_SLOT_MS)
+ ((unsigned long)RELAYS_PER_CHANNEL_GROUP * RELAY_BEACON_SLOT_MS)
 #define PHASE_GUARD_MS 500UL
 #define CURRENT_RELAY_TIMEOUT_MS 30000UL
-#define MAX_RELAY_CANDIDATES RELAYS_PER_GROUP
+#define MAX_RELAY_CANDIDATES RELAYS_PER_CHANNEL_GROUP
 #define EMERGENCY_TX_TOTAL_COUNT 3
 #define EMERGENCY_RETRY_INTERVAL_MS 800UL
 #define EMERGENCY_BACKOFF_MAX_MS 200UL
 #define EMERGENCY_BROADCAST_RELAY_ID 0
+#define CHANNEL_FALLBACK_SCAN_ENABLE true
+#define FALLBACK_SCAN_NEXT_GROUP true
+#define FALLBACK_SCAN_PREV_GROUP true
+#define MAX_SCAN_GROUPS 3
 
 // for testing without actual Relay/BEACON, set DUMMY_BEACON_MODE to true to generate fake BEACON packets periodically.
 #define DUMMY_BEACON_MODE false
@@ -140,6 +155,12 @@ int emergencyTxCount = 0;
 unsigned long nextEmergencyTxTime = 0;
 unsigned long emergencySeq = 0;
 bool lastButtonState = !SOS_ACTIVE_LEVEL;
+int currentRadioGroupIndex = -1;
+int primaryGroupIndex = 0;
+int scanGroups[MAX_SCAN_GROUPS];
+int scanGroupCount = 0;
+int scanGroupCursor = 0;
+bool fallbackScanActive = false;
 
 void setLoRaFlag(void){
   receivedFlag = true;
@@ -162,6 +183,17 @@ int getRelayGroupIndex(float totalDistanceM);
 int getGroupStartRelayId(float totalDistanceM);
 int getGroupEndRelayId(float totalDistanceM);
 bool isRelayInCurrentGroup(int relayId, float totalDistanceM);
+int getChannelCount();
+int clampGroupIndex(int groupIndex);
+float getChannelFrequencyMHzByGroup(int groupIndex);
+int getRelayGroupIndexByRelayId(int relayId);
+int getRelaySlotInChannel(int relayId);
+bool switchRunnerChannelToGroup(int groupIndex);
+void buildScanGroupList();
+bool isRelayInScannedGroup(int relayId);
+bool hasAvailableRelayCandidate();
+bool moveToNextScanGroup();
+void updateRunnerChannelForCurrentPositionIfIdle();
 void handleBeacon(String msg, int rssi, float snr);
 bool canUseRelayCandidate(RelayCandidate c, bool isCurrentRelay);
 float getRelayScore(RelayCandidate c);
@@ -237,6 +269,11 @@ void setup(){
     // Set the DIO1 interrupt handler to set the receivedFlag when a packet is received
     radio.setDio1Action(setLoRaFlag);
 
+    // Initialize scan groups and switch to the current position channel.
+    resetBeaconCandidates();
+    buildScanGroupList();
+    switchRunnerChannelToGroup(scanGroups[0]);
+
     // Start in receive mode to listen for BEACON packets from Relays
     state = radio.startReceive();
     if(state == RADIOLIB_ERR_NONE){
@@ -248,8 +285,6 @@ void setup(){
 
     Serial.println("[LoRa] 915 MHz, SF7, BW125 kHz, CR4/5, SyncWord 0x33, CRC ON");
 
-    // Initialize beacon candidates and change to WAIT_BEACON state
-    resetBeaconCandidates();
     changeState(WAIT_BEACON);
 }
 
@@ -329,6 +364,7 @@ void loop(){
     // Always read GPS data to keep location updated, even when not sending status.
     //so that the latest position is available when it's time to send.
     updateGPS();
+    updateRunnerChannelForCurrentPositionIfIdle();
     updateSOSButton();
     handleEmergencyImmediate();
 
@@ -367,7 +403,14 @@ void loop(){
                 
                 // If tehre are no candidates, skip to the end of the cycle and wait for the next BEACON.
                 if(selectedRelayId <= 0){
-                    Serial.println("[SELECT] No valid BEACON. Skip this cycle.");
+                    Serial.println("[SELECT] No available Relay in this channel group.");
+
+                    if(moveToNextScanGroup()){
+                        Serial.println("[SELECT] Fallback scan started.");
+                        break;
+                    }
+
+                    Serial.println("[SELECT] No valid Relay in all scan groups. Skip this cycle.");
                     changeState(CYCLE_DONE);
                     break;
                 }
@@ -653,6 +696,17 @@ void handleEmergencyImmediate(){
 }
 
 void sendEmergencyDataNow(int targetRelayId, unsigned long eventSeq){
+  if(targetRelayId > 0){
+    int relayGroup = getRelayGroupIndexByRelayId(targetRelayId);
+    Serial.println("[EMERGENCY] Using selected relay group channel");
+    switchRunnerChannelToGroup(relayGroup);
+  }else{
+    Serial.println("[EMERGENCY] No selected relay. Broadcast in current channel group.");
+    if(currentRadioGroupIndex < 0){
+      switchRunnerChannelToGroup(primaryGroupIndex);
+    }
+  }
+
   int pace = calculatePace();
   int battery = readBatteryPercent();
 
@@ -739,18 +793,168 @@ int getRelayGroupIndex(float distanceM){
 
 // Get the start Relay ID of the current group based on the total distance.
 int getGroupStartRelayId(float distanceM){
-  return getRelayGroupIndex(distanceM)* RELAYS_PER_GROUP + 1;
+  return getRelayGroupIndex(distanceM) * CHANNEL_GROUP_COUNT + 1;
 }
 
 // Get the end Relay ID of the current group based on the total distance.
 int getGroupEndRelayId(float distanceM){
-  return getGroupStartRelayId(distanceM)+ RELAYS_PER_GROUP - 1;
+  return getGroupStartRelayId(distanceM) + CHANNEL_GROUP_COUNT - 1;
 }
 
 // Check if the given Relay ID belongs to the current group
 bool isRelayInCurrentGroup(int relayId, float distanceM){
   return relayId >= getGroupStartRelayId(distanceM)&&
          relayId <= getGroupEndRelayId(distanceM);
+}
+
+int getChannelCount(){
+  return sizeof(CHANNEL_FREQ_MHZ) / sizeof(CHANNEL_FREQ_MHZ[0]);
+}
+
+int clampGroupIndex(int groupIndex){
+  int channelCount = getChannelCount();
+
+  if(groupIndex < 0){
+    return 0;
+  }
+
+  if(groupIndex >= channelCount){
+    return channelCount - 1;
+  }
+
+  return groupIndex;
+}
+
+float getChannelFrequencyMHzByGroup(int groupIndex){
+  groupIndex = clampGroupIndex(groupIndex);
+  return CHANNEL_FREQ_MHZ[groupIndex];
+}
+
+int getRelayGroupIndexByRelayId(int relayId){
+  return (relayId - 1) % CHANNEL_GROUP_COUNT;
+}
+
+int getRelaySlotInChannel(int relayId){
+  return (relayId - 1) / CHANNEL_GROUP_COUNT;
+}
+
+bool switchRunnerChannelToGroup(int groupIndex){
+  groupIndex = clampGroupIndex(groupIndex);
+
+  if(currentRadioGroupIndex == groupIndex){
+    return true;
+  }
+
+  float freqMHz = getChannelFrequencyMHzByGroup(groupIndex);
+
+  Serial.print("[CHANNEL] Switch Runner to group ");
+  Serial.print(groupIndex + 1);
+  Serial.print(", freq=");
+  Serial.print(freqMHz, 2);
+  Serial.println(" MHz");
+
+  radio.standby();
+
+  int state = radio.setFrequency(freqMHz);
+  if(state == RADIOLIB_ERR_NONE){
+    currentRadioGroupIndex = groupIndex;
+    Serial.println("[CHANNEL] Frequency switch success");
+    radio.startReceive();
+    return true;
+  }
+
+  Serial.print("[CHANNEL][ERROR] setFrequency failed, code=");
+  Serial.println(state);
+  radio.startReceive();
+  return false;
+}
+
+void buildScanGroupList(){
+  primaryGroupIndex = clampGroupIndex(getRelayGroupIndex(totalDistanceM));
+  scanGroupCount = 0;
+  scanGroupCursor = 0;
+  fallbackScanActive = false;
+
+  scanGroups[scanGroupCount++] = primaryGroupIndex;
+
+  if(CHANNEL_FALLBACK_SCAN_ENABLE && FALLBACK_SCAN_NEXT_GROUP){
+    int nextGroup = primaryGroupIndex + 1;
+    if(nextGroup < getChannelCount() && scanGroupCount < MAX_SCAN_GROUPS){
+      scanGroups[scanGroupCount++] = nextGroup;
+    }
+  }
+
+  if(CHANNEL_FALLBACK_SCAN_ENABLE && FALLBACK_SCAN_PREV_GROUP){
+    int prevGroup = primaryGroupIndex - 1;
+    if(prevGroup >= 0 && scanGroupCount < MAX_SCAN_GROUPS){
+      scanGroups[scanGroupCount++] = prevGroup;
+    }
+  }
+}
+
+bool isRelayInScannedGroup(int relayId){
+  int relayGroup = getRelayGroupIndexByRelayId(relayId);
+
+  for(int i = 0; i < scanGroupCount; i++){
+    if(scanGroups[i] == relayGroup){
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool hasAvailableRelayCandidate(){
+  for(int i = 0; i < MAX_RELAY_CANDIDATES; i++){
+    if(relayCandidates[i].valid &&
+       relayCandidates[i].cycleId == activeCycleId &&
+       relayCandidates[i].currentCount < relayCandidates[i].maxCount){
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool moveToNextScanGroup(){
+  scanGroupCursor++;
+
+  if(scanGroupCursor >= scanGroupCount){
+    return false;
+  }
+
+  fallbackScanActive = true;
+  int nextGroup = scanGroups[scanGroupCursor];
+
+  Serial.print("[CHANNEL][FALLBACK] Move to scan group ");
+  Serial.println(nextGroup + 1);
+
+  resetBeaconCandidates();
+  switchRunnerChannelToGroup(nextGroup);
+  changeState(WAIT_BEACON);
+
+  return true;
+}
+
+void updateRunnerChannelForCurrentPositionIfIdle(){
+  if(DUMMY_BEACON_MODE){
+    return;
+  }
+
+  if(currentState != WAIT_BEACON){
+    return;
+  }
+
+  int newPrimaryGroup = clampGroupIndex(getRelayGroupIndex(totalDistanceM));
+
+  if(newPrimaryGroup != primaryGroupIndex || currentRadioGroupIndex < 0){
+    Serial.print("[CHANNEL] Position group changed. new group=");
+    Serial.println(newPrimaryGroup + 1);
+
+    buildScanGroupList();
+    resetBeaconCandidates();
+    switchRunnerChannelToGroup(scanGroups[0]);
+  }
 }
 
 void handleBeacon(String msg, int rssi, float snr){
@@ -784,12 +988,10 @@ void handleBeacon(String msg, int rssi, float snr){
     return;
   }
 
-  // 이 부분 다시 체크
-  if(!isRelayInCurrentGroup(relayId, totalDistanceM)){
+  if(!isRelayInScannedGroup(relayId)){
     Serial.print("[BEACON] Ignored relay ");
     Serial.print(relayId);
-    Serial.print(": current group is ");
-    Serial.println(getRelayGroupIndex(totalDistanceM)+ 1);
+    Serial.println(": relay group is not in scanned group list");
     return;
   }
 
@@ -894,7 +1096,7 @@ void handleBeacon(String msg, int rssi, float snr){
 bool canUseRelayCandidate(RelayCandidate candidate, bool isCurrentRelay){
   if(!candidate.valid)return false;
   if(candidate.cycleId != activeCycleId)return false;
-  if(!isRelayInCurrentGroup(candidate.relayId, totalDistanceM))return false;
+  if(!isRelayInScannedGroup(candidate.relayId))return false;
   if(candidate.maxCount <= 0)return false;
 
   if(isCurrentRelay)return candidate.currentCount <= candidate.maxCount;
@@ -926,7 +1128,7 @@ int selectBestRelay(){
 }
 
 bool shouldKeepCurrentRelay(){
-  if(selectedRelayId <= 0 || !isRelayInCurrentGroup(selectedRelayId, totalDistanceM)){
+  if(selectedRelayId <= 0 || !isRelayInScannedGroup(selectedRelayId)){
     return false;
   }
 
@@ -967,6 +1169,9 @@ void updateSelectedRelay(){
   }
 
   RelayCandidate &selected = relayCandidates[bestIndex];
+  int selectedGroupIndex = getRelayGroupIndexByRelayId(selected.relayId);
+  switchRunnerChannelToGroup(selectedGroupIndex);
+
   if(oldRelayId > 0 && oldRelayId != selected.relayId){
     sendHandoverPacket(oldRelayId, selected.relayId);
   }
@@ -982,6 +1187,8 @@ void updateSelectedRelay(){
 
   Serial.print("[RELAY_SELECT] Selected relay ");
   Serial.print(selectedRelayId);
+  Serial.print(", group=");
+  Serial.print(selectedGroupIndex + 1);
   Serial.print(", score=");
   Serial.println(getRelayScore(selected), 2);
 }
@@ -1010,6 +1217,10 @@ void sendRunnerStatus(){
   int pace = calculatePace();
   int battery = readBatteryPercent();
   char status = getRunnerStatus();
+
+  int selectedGroupIndex = getRelayGroupIndexByRelayId(selectedRelayId);
+  Serial.println("[CHANNEL] Using selected relay group channel before DATA TX");
+  switchRunnerChannelToGroup(selectedGroupIndex);
 
   // DATA,cycle_id,runner_id,selectedRelayId,lat,lng,pace,battery,seq,gps_valid,status
   String message = "DATA,";
