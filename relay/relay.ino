@@ -20,11 +20,25 @@
 // Relay1은 1, Relay2는 2로 설정한다.
 #define RELAY_ID 1
 
-// Runner 없이 Gateway-Relay 통신을 시험할 때 true로 설정한다.
-#define TEST_DUMMY_MODE true
-#define DUMMY_GATEWAY_RECEIVE_MODE true
-#define DUMMY_RELAY_CYCLE_INTERVAL_MS 3000UL
-#define DUMMY_RUNNER_SLOT_MS 150
+// Relay 단독 self-test: Gateway와 Runner를 코드 안에서 흉내 낸다.
+#define RELAY_SELF_TEST_MODE true
+
+#define SELF_TEST_CYCLE_INTERVAL_MS 3000UL
+#define SELF_TEST_RUNNER_SLOT_MS 150
+
+#define SELF_TEST_RUNNER_NORMAL_ENABLE true
+#define SELF_TEST_RUNNER_EMERGENCY_ENABLE true
+
+#define SELF_TEST_NORMAL_RUNNER_ID 1
+#define SELF_TEST_EMERGENCY_RUNNER_ID 2
+
+#define SELF_TEST_NORMAL_DATA_DELAY_MS 300UL
+#define SELF_TEST_EMERGENCY_START_DELAY_MS 700UL
+#define SELF_TEST_EMERGENCY_RETRY_INTERVAL_MS 300UL
+#define SELF_TEST_EMERGENCY_RETRY_COUNT 3
+
+#define SELF_TEST_DUMMY_RSSI -55
+#define SELF_TEST_DUMMY_SNR 8.5
 
 #define LORA_FREQUENCY 915E6
 #define LORA_SYNC_WORD 0x33
@@ -46,6 +60,7 @@
 #define MAX_ACTIVE_RUNNERS 300
 #define MAX_BUFFER_SIZE MAX_ACTIVE_RUNNERS
 #define FORWARD_INTERVAL_MS 400UL
+#define EMERGENCY_GATEWAY_FORWARD_MAX 3
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool oledReady = false;
@@ -93,9 +108,14 @@ unsigned long scheduleReceivedTime = 0;
 unsigned long beaconSendTime = 0;
 unsigned long runnerPhaseEndTime = 0;
 unsigned long stateStartTime = 0;
-unsigned long lastDummyRelayCycleTime = 0;
+unsigned long lastSelfTestCycleTime = 0;
 
-int dummyRelayCycleId = 1;
+int selfTestCycleId = 1;
+int selfTestNormalSeq = 1;
+int selfTestEmergencySeq = 1001;
+int selfTestEmergencyInjectCount = 0;
+bool selfTestNormalInjected = false;
+bool selfTestSendNowInjected = false;
 
 // Gateway timeout 등의 이유로 SEND_NOW가 Runner phase 중 먼저 온 경우 기억한다.
 bool pendingSendNow = false;
@@ -123,20 +143,26 @@ void handleReceivedPacket(String msg, int rssi, float snr); // 수신 패킷 종
 void forwardBufferedPacketsToGateway();
 void sendDonePacket();
 void handleSendNowPacket(String msg);
-void injectDummyRelayCycleIfNeeded();
+void startSelfTestCycle();
+void injectSelfTestRunnerPacketsIfNeeded();
+String makeSelfTestRunnerDataPacket(int cycleId, int runnerId,
+                                    int targetRelayId, char status,
+                                    int seq);
+void injectSelfTestSendNowIfNeeded();
 void clearRelayBuffer();
 void changeState(RelayState nextState);
 const char *stateName(RelayState state);
 void updateOLED();
 int lastEmergencySeq[TOTAL_RUNNERS + 1];
+int emergencyForwardCount[TOTAL_RUNNERS + 1];
 void sendEmergencyPacketToGateway(int cycleId, int runnerId,
                                   String lat, String lng,
                                   int pace, int battery,
                                   char status, int seq,
                                   int rssi, float snr);
 
-void dummyGatewayReceive(String msg);
-void dummyGatewayHandleDone(String msg);
+void selfTestGatewayReceive(String msg);
+void selfTestGatewayHandleDone(String msg);
 
 void setup(){
   Serial.begin(115200);
@@ -148,8 +174,8 @@ void setup(){
   Serial.println("========================================");
   Serial.print("[CONFIG] RELAY_ID: ");
   Serial.println(RELAY_ID);
-  Serial.print("[CONFIG] TEST_DUMMY_MODE: ");
-  Serial.println(TEST_DUMMY_MODE ? "true" : "false");
+  Serial.print("[CONFIG] RELAY_SELF_TEST_MODE: ");
+  Serial.println(RELAY_SELF_TEST_MODE ? "true" : "false");
 
   if(RELAY_ID <= 0){
     Serial.println("[ERROR] RELAY_ID must be greater than 0.");
@@ -199,8 +225,9 @@ void setup(){
   initActiveRunners();
   for(int i = 0; i <= TOTAL_RUNNERS; i++){
     lastEmergencySeq[i] = -1;
+    emergencyForwardCount[i] = 0;
   }
-  lastDummyRelayCycleTime = millis()- DUMMY_RELAY_CYCLE_INTERVAL_MS;
+  lastSelfTestCycleTime = millis() - SELF_TEST_CYCLE_INTERVAL_MS;
   currentState = WAIT_SCHEDULE;
   stateStartTime = millis();
   updateOLED();
@@ -208,7 +235,10 @@ void setup(){
 
 void loop(){
   cleanupActiveRunners();
-  injectDummyRelayCycleIfNeeded();
+
+  if(RELAY_SELF_TEST_MODE){
+    startSelfTestCycle();
+  }
 
   // 현재 상태에 필요한 packet만 처리한다.
   if(currentState == WAIT_SCHEDULE ||
@@ -222,6 +252,11 @@ void loop(){
     if(receiveLoRaMessage(message, rssi, snr)){
       handleReceivedPacket(message, rssi, snr);
     }
+  }
+
+  if(RELAY_SELF_TEST_MODE){
+    injectSelfTestRunnerPacketsIfNeeded();
+    injectSelfTestSendNowIfNeeded();
   }
 
   switch(currentState){
@@ -302,8 +337,8 @@ void sendLoRaMessage(String msg){
     Serial.print("[TX] ");
     Serial.println(msg);
 
-    if(DUMMY_GATEWAY_RECEIVE_MODE){
-      dummyGatewayReceive(msg);
+    if(RELAY_SELF_TEST_MODE){
+      selfTestGatewayReceive(msg);
     }
 
   }else {
@@ -626,14 +661,6 @@ void handleRunnerData(String msg, int rssi, float snr){
   String statusField = getField(msg, 10);
   char status = statusField.charAt(0);
 
-  if(packetCycleId != activeCycleId){
-    Serial.print("[DATA] Dropped: cycle ");
-    Serial.print(packetCycleId);
-    Serial.print(" does not match active cycle ");
-    Serial.println(activeCycleId);
-    return;
-  }
-
   if(runnerId <= 0 || runnerId > TOTAL_RUNNERS || seq < 0){
     Serial.println("[DATA][ERROR] Invalid runner_id or seq");
     return;
@@ -646,6 +673,21 @@ void handleRunnerData(String msg, int rssi, float snr){
   }
 
   bool isEmergency = (status == 'E');
+  if(!isEmergency && packetCycleId != activeCycleId){
+    Serial.print("[DATA] Dropped: cycle ");
+    Serial.print(packetCycleId);
+    Serial.print(" does not match active cycle ");
+    Serial.println(activeCycleId);
+    return;
+  }
+
+  if(isEmergency && packetCycleId != activeCycleId){
+    Serial.print("[EMERGENCY] Accepted despite cycle mismatch. packetCycle=");
+    Serial.print(packetCycleId);
+    Serial.print(", activeCycle=");
+    Serial.println(activeCycleId);
+  }
+
   if(targetRelayId != RELAY_ID &&
      !(isEmergency && targetRelayId == 0)){
     Serial.print("[DATA] Dropped: selected relay ");
@@ -665,17 +707,38 @@ void handleRunnerData(String msg, int rssi, float snr){
     upsertActiveRunner(runnerId);
 
     if(lastEmergencySeq[runnerId] != seq){
-      Serial.print("[EMERGENCY][PRIORITY] runner ");
+      lastEmergencySeq[runnerId] = seq;
+      emergencyForwardCount[runnerId] = 0;
+
+      Serial.print("[EMERGENCY][NEW] runner ");
       Serial.print(runnerId);
       Serial.print(", seq=");
       Serial.println(seq);
+    }
 
-      sendEmergencyPacketToGateway(packetCycleId, runnerId, lat, lng,
+    if(emergencyForwardCount[runnerId] < EMERGENCY_GATEWAY_FORWARD_MAX){
+      int emergencyCycleId = packetCycleId;
+      if(emergencyCycleId < 0){
+        emergencyCycleId = activeCycleId;
+      }
+
+      Serial.print("[EMERGENCY][FORWARD_RETRY] runner=");
+      Serial.print(runnerId);
+      Serial.print(", seq=");
+      Serial.print(seq);
+      Serial.print(", forward_count=");
+      Serial.print(emergencyForwardCount[runnerId] + 1);
+      Serial.print("/");
+      Serial.println(EMERGENCY_GATEWAY_FORWARD_MAX);
+
+      sendEmergencyPacketToGateway(emergencyCycleId, runnerId, lat, lng,
                                    pace, battery, status, seq, rssi, snr);
-      lastEmergencySeq[runnerId] = seq;
+      emergencyForwardCount[runnerId]++;
     }else{
-      Serial.print("[EMERGENCY] Duplicate emergency retry ignored from runner ");
-      Serial.println(runnerId);
+      Serial.print("[EMERGENCY] Forward limit reached. runner=");
+      Serial.print(runnerId);
+      Serial.print(", seq=");
+      Serial.println(seq);
     }
 
     return;
@@ -881,57 +944,175 @@ void handleSendNowPacket(String msg){
   }
 }
 
-void injectDummyRelayCycleIfNeeded(){
-  if(!TEST_DUMMY_MODE){
+void startSelfTestCycle(){
+  if(!RELAY_SELF_TEST_MODE){
     return;
   }
 
-  if(currentState == WAIT_SCHEDULE){
-    if((unsigned long)(millis()- lastDummyRelayCycleTime)<
-        DUMMY_RELAY_CYCLE_INTERVAL_MS){
-      return;
+  if(currentState != WAIT_SCHEDULE){
+    return;
+  }
+
+  if((unsigned long)(millis() - lastSelfTestCycleTime) <
+      SELF_TEST_CYCLE_INTERVAL_MS){
+    return;
+  }
+
+  clearRelayBuffer();
+  activeCycleId = selfTestCycleId++;
+  relayCount = RELAYS_PER_GROUP;
+  runnerCount = TOTAL_RUNNERS;
+  runnerSlotMs = SELF_TEST_RUNNER_SLOT_MS;
+  pendingSendNow = false;
+  selfTestNormalInjected = false;
+  selfTestEmergencyInjectCount = 0;
+  selfTestSendNowInjected = false;
+  selfTestNormalSeq = 1;
+  selfTestEmergencySeq = 1000 + activeCycleId;
+  scheduleReceivedTime = millis();
+  beaconSendTime = millis();
+
+  unsigned long beaconPhaseMs =
+      (unsigned long)RELAYS_PER_GROUP * RELAY_BEACON_SLOT_MS;
+  unsigned long runnerPhaseMs =
+      (unsigned long)RELAY_MAX_COUNT * (unsigned long)runnerSlotMs;
+  runnerPhaseEndTime =
+      millis() + beaconPhaseMs + PHASE_GUARD_MS + runnerPhaseMs;
+  lastSelfTestCycleTime = millis();
+
+  Serial.println();
+  Serial.println("[SELF_TEST] Starting Relay self-test cycle");
+  Serial.print("[SELF_TEST] cycle=");
+  Serial.print(activeCycleId);
+  Serial.print(", relay=");
+  Serial.print(RELAY_ID);
+  Serial.print(", runnerSlotMs=");
+  Serial.println(runnerSlotMs);
+
+  changeState(SEND_BEACON);
+}
+
+void injectSelfTestRunnerPacketsIfNeeded(){
+  if(!RELAY_SELF_TEST_MODE){
+    return;
+  }
+
+  if(currentState != COLLECT_RUNNER_DATA){
+    return;
+  }
+
+  unsigned long elapsed = millis() - stateStartTime;
+
+  if(SELF_TEST_RUNNER_NORMAL_ENABLE &&
+     !selfTestNormalInjected &&
+     elapsed >= SELF_TEST_NORMAL_DATA_DELAY_MS){
+    String message =
+        makeSelfTestRunnerDataPacket(activeCycleId,
+                                     SELF_TEST_NORMAL_RUNNER_ID,
+                                     RELAY_ID,
+                                     'M',
+                                     selfTestNormalSeq);
+
+    Serial.print("[SELF_TEST RUNNER] Inject normal DATA: ");
+    Serial.println(message);
+    handleRunnerData(message, SELF_TEST_DUMMY_RSSI, SELF_TEST_DUMMY_SNR);
+    selfTestNormalInjected = true;
+  }
+
+  if(SELF_TEST_RUNNER_EMERGENCY_ENABLE &&
+     selfTestEmergencyInjectCount < SELF_TEST_EMERGENCY_RETRY_COUNT){
+    unsigned long emergencyDelay =
+        SELF_TEST_EMERGENCY_START_DELAY_MS +
+        (unsigned long)selfTestEmergencyInjectCount *
+            SELF_TEST_EMERGENCY_RETRY_INTERVAL_MS;
+
+    if(elapsed >= emergencyDelay){
+      String message =
+          makeSelfTestRunnerDataPacket(activeCycleId,
+                                       SELF_TEST_EMERGENCY_RUNNER_ID,
+                                       0,
+                                       'E',
+                                       selfTestEmergencySeq);
+
+      Serial.print("[SELF_TEST RUNNER] Inject EMERGENCY retry ");
+      Serial.print(selfTestEmergencyInjectCount + 1);
+      Serial.print("/");
+      Serial.print(SELF_TEST_EMERGENCY_RETRY_COUNT);
+      Serial.print(": ");
+      Serial.println(message);
+      handleRunnerData(message, SELF_TEST_DUMMY_RSSI, SELF_TEST_DUMMY_SNR);
+      selfTestEmergencyInjectCount++;
     }
-
-    clearRelayBuffer();
-    activeCycleId = dummyRelayCycleId++;
-    relayCount = RELAYS_PER_GROUP;
-    runnerCount = RELAY_MAX_COUNT;
-    runnerSlotMs = DUMMY_RUNNER_SLOT_MS;
-    pendingSendNow = false;
-    scheduleReceivedTime = millis();
-    beaconSendTime = millis();
-    unsigned long beaconPhaseMs =
-       (unsigned long)RELAYS_PER_GROUP * RELAY_BEACON_SLOT_MS;
-    unsigned long runnerPhaseMs =
-       (unsigned long)RELAY_MAX_COUNT *(unsigned long)runnerSlotMs;
-    runnerPhaseEndTime =
-        millis()+ beaconPhaseMs + PHASE_GUARD_MS + runnerPhaseMs;
-    lastDummyRelayCycleTime = millis();
-
-    Serial.println();
-    Serial.println("[DUMMY] Starting LoRa end-to-end test cycle");
-    Serial.print("[DUMMY] cycle=");
-    Serial.print(activeCycleId);
-    Serial.print(", relay=");
-    Serial.println(RELAY_ID);
-    Serial.print("[DUMMY] Waiting for real Runner DATA until millis=");
-    Serial.println(runnerPhaseEndTime);
-
-    changeState(SEND_BEACON);
   }
 }
 
-void dummyGatewayReceive(String msg){
-  if(!DUMMY_GATEWAY_RECEIVE_MODE){
+String makeSelfTestRunnerDataPacket(int cycleId, int runnerId,
+                                    int targetRelayId, char status,
+                                    int seq){
+  String lat = "36.103210";
+  String lng = "129.387120";
+  int pace = 342;
+  int battery = 78;
+
+  if(status == 'E'){
+    lat = "36.103500";
+    lng = "129.387500";
+    pace = 410;
+    battery = 80;
+  }
+
+  String message = "DATA,";
+  message += String(cycleId);
+  message += ",";
+  message += String(runnerId);
+  message += ",";
+  message += String(targetRelayId);
+  message += ",";
+  message += lat;
+  message += ",";
+  message += lng;
+  message += ",";
+  message += String(pace);
+  message += ",";
+  message += String(battery);
+  message += ",";
+  message += String(seq);
+  message += ",1,";
+  message += String(status);
+
+  return message;
+}
+
+void injectSelfTestSendNowIfNeeded(){
+  if(!RELAY_SELF_TEST_MODE ||
+     selfTestSendNowInjected ||
+     currentState != WAIT_SEND_NOW ||
+     RELAY_ID != 2){
+    return;
+  }
+
+  String message = "SEND_NOW,";
+  message += String(activeCycleId);
+  message += ",";
+  message += String(RELAY_ID);
+
+  Serial.print("[SELF_TEST GATEWAY] Inject SEND_NOW: ");
+  Serial.println(message);
+  handleSendNowPacket(message);
+  selfTestSendNowInjected = true;
+}
+
+void selfTestGatewayReceive(String msg){
+  if(!RELAY_SELF_TEST_MODE){
     return;
   }
 
   Serial.println();
-  Serial.println("========== [DUMMY GATEWAY RX] ==========");
+  Serial.println("========== [SELF_TEST GATEWAY RX] ==========");
 
   if(startsWithPacket(msg, "EMERGENCY")){
-    Serial.println("[DUMMY GATEWAY] EMERGENCY RECEIVED");
-    Serial.print("[DUMMY GATEWAY][EMERGENCY] ");
+    Serial.println("[SELF_TEST GATEWAY] EMERGENCY RECEIVED");
+    Serial.print("[SELF_TEST GATEWAY][EMERGENCY] ");
     Serial.println(msg);
 
     int cycleId = getField(msg, 1).toInt();
@@ -965,8 +1146,8 @@ void dummyGatewayReceive(String msg){
   }
 
   else if(startsWithPacket(msg, "FORWARD")){
-    Serial.println("[DUMMY GATEWAY] FORWARD RECEIVED");
-    Serial.print("[DUMMY GATEWAY][FORWARD] ");
+    Serial.println("[SELF_TEST GATEWAY] FORWARD RECEIVED");
+    Serial.print("[SELF_TEST GATEWAY][FORWARD] ");
     Serial.println(msg);
 
     int cycleId = getField(msg, 1).toInt();
@@ -997,21 +1178,21 @@ void dummyGatewayReceive(String msg){
   }
 
   else if(startsWithPacket(msg, "DONE")){
-    Serial.println("[DUMMY GATEWAY] DONE RECEIVED");
-    Serial.print("[DUMMY GATEWAY][DONE] ");
+    Serial.println("[SELF_TEST GATEWAY] DONE RECEIVED");
+    Serial.print("[SELF_TEST GATEWAY][DONE] ");
     Serial.println(msg);
 
-    dummyGatewayHandleDone(msg);
+    selfTestGatewayHandleDone(msg);
   }
 
   else if(startsWithPacket(msg, "BEACON")){
-    Serial.println("[DUMMY GATEWAY] BEACON observed");
-    Serial.print("[DUMMY GATEWAY][BEACON] ");
+    Serial.println("[SELF_TEST GATEWAY] BEACON observed");
+    Serial.print("[SELF_TEST GATEWAY][BEACON] ");
     Serial.println(msg);
   }
 
   else {
-    Serial.println("[DUMMY GATEWAY] UNKNOWN PACKET");
+    Serial.println("[SELF_TEST GATEWAY] UNKNOWN PACKET");
     Serial.println(msg);
   }
 
@@ -1019,13 +1200,13 @@ void dummyGatewayReceive(String msg){
   Serial.println();
 }
 
-void dummyGatewayHandleDone(String msg){
+void selfTestGatewayHandleDone(String msg){
   // DONE,cycle_id,relay_id,count
   int cycleId = getField(msg, 1).toInt();
   int relayId = getField(msg, 2).toInt();
   int count = getField(msg, 3).toInt();
 
-  Serial.print("[DUMMY GATEWAY] cycle=");
+  Serial.print("[SELF_TEST GATEWAY] cycle=");
   Serial.print(cycleId);
   Serial.print(", relay=");
   Serial.print(relayId);
@@ -1033,12 +1214,12 @@ void dummyGatewayHandleDone(String msg){
   Serial.println(count);
 
   if(relayId == 1){
-    Serial.println("[DUMMY GATEWAY] Relay1 finished.");
-    Serial.println("[DUMMY GATEWAY] In real gateway, SEND_NOW would be sent to Relay2.");
+    Serial.println("[SELF_TEST GATEWAY] Relay1 finished.");
+    Serial.println("[SELF_TEST GATEWAY] In real gateway, SEND_NOW would be sent to Relay2.");
   }
 
   if(relayId == 2){
-    Serial.println("[DUMMY GATEWAY] Relay2 finished. Cycle complete.");
+    Serial.println("[SELF_TEST GATEWAY] Relay2 finished. Cycle complete.");
   }
 }
 

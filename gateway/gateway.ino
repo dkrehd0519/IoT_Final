@@ -28,6 +28,7 @@
 #define RELAY_COUNT 2
 #define RUNNER_COUNT 3
 #define RUNNER_SLOT_MS 150
+#define MAX_RUNNERS RUNNER_COUNT
 
 #define RELAY1_ID 1
 #define RELAY2_ID 2
@@ -60,6 +61,7 @@ int relay1DoneCount = -1;
 int relay2DoneCount = -1;
 bool relay1TimedOut = false;
 bool relay2TimedOut = false;
+int lastGatewayEmergencySeq[MAX_RUNNERS + 1];
 
 void showOLED(String line1, String line2 = "", String line3 = "", String line4 = "");
 void sendLoRaMessage(String msg);
@@ -120,6 +122,10 @@ void setup(){
 
   Serial.println("[LoRa] Initialization complete");
   Serial.println("[LoRa] 915 MHz, SF7, BW125 kHz, CR4/5, SyncWord 0x33, CRC ON");
+
+  for(int i = 0; i <= MAX_RUNNERS; i++){
+    lastGatewayEmergencySeq[i] = -1;
+  }
 
   currentState = START_CYCLE;
   stateStartTime = millis();
@@ -508,6 +514,19 @@ void handleEmergencyPacket(String msg, int rssi, float snr){
   unsigned long packetCycleId = (unsigned long)getField(msg, 1).toInt();
   int relayId = getField(msg, 2).toInt();
   int runnerId = getField(msg, 3).toInt();
+  int seq = getField(msg, 9).toInt();
+
+  if(runnerId > 0 && runnerId <= MAX_RUNNERS){
+    if(lastGatewayEmergencySeq[runnerId] == seq){
+      Serial.print("[EMERGENCY][DUPLICATE] Already displayed. runner=");
+      Serial.print(runnerId);
+      Serial.print(", seq=");
+      Serial.println(seq);
+      return;
+    }
+
+    lastGatewayEmergencySeq[runnerId] = seq;
+  }
 
   Serial.println();
   Serial.println("🚨 [EMERGENCY RECEIVED]");

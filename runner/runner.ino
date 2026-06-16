@@ -35,7 +35,7 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 #define RELAY_BEACON_SLOT_MS 500UL
 #define BEACON_COLLECTION_MS \
  ((unsigned long)RELAYS_PER_GROUP * RELAY_BEACON_SLOT_MS)
-#define PHASE_GUARD_MS 300UL
+#define PHASE_GUARD_MS 500UL
 #define CURRENT_RELAY_TIMEOUT_MS 30000UL
 #define MAX_RELAY_CANDIDATES RELAYS_PER_GROUP
 #define EMERGENCY_TX_TOTAL_COUNT 3
@@ -613,8 +613,7 @@ void updateSOSButton(){
       emergencyPending = true;
       emergencyTxCount = 0;
       emergencySeq++;
-      nextEmergencyTxTime =
-          millis() + random(0, EMERGENCY_BACKOFF_MAX_MS);
+      nextEmergencyTxTime = millis() + random(0, EMERGENCY_BACKOFF_MAX_MS);
       Serial.println("[SOS] Emergency one-shot event triggered");
     }
   }
