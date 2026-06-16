@@ -27,7 +27,7 @@
 
 #define RELAY_COUNT 2
 #define RUNNER_COUNT 3
-#define RUNNER_SLOT_MS 1000
+#define RUNNER_SLOT_MS 150
 
 #define RELAY1_ID 1
 #define RELAY2_ID 2
@@ -73,8 +73,9 @@ void handleDonePacket(String msg);
 void changeState(GatewayState nextState);
 const char *stateName(GatewayState state);
 void updateWaitingOLED();
+void handleEmergencyPacket(String msg, int rssi, float snr);
 
-void setup() {
+void setup(){
   Serial.begin(115200);
   delay(1000);
 
@@ -87,7 +88,7 @@ void setup() {
   Wire.begin(OLED_SDA, OLED_SCL);
   oledReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
 
-  if (oledReady) {
+  if(oledReady){
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
@@ -99,11 +100,11 @@ void setup() {
 
   // 보드 버전에 따라 LoRa 핀 수정이 필요할 수 있다.
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (!LoRa.begin(LORA_FREQUENCY)) {
+  if(!LoRa.begin(LORA_FREQUENCY)){
     Serial.println("[ERROR] LoRa initialization failed. Check wiring and board pins.");
     showOLED("LoRa ERROR", "Check pins", "Gateway stopped");
 
-    while (true) {
+    while(true){
       delay(1000);
     }
   }
@@ -124,25 +125,27 @@ void setup() {
   stateStartTime = millis();
 }
 
-void loop() {
+void loop(){
   // Relay 수신 단계에서만 LoRa packet을 처리한다.
-  if (currentState == WAIT_RELAY1_DATA || currentState == WAIT_RELAY2_DATA) {
+  if(currentState == WAIT_RELAY1_DATA || currentState == WAIT_RELAY2_DATA){
     String message;
     int rssi = 0;
     float snr = 0.0;
 
-    if (receiveLoRaMessage(message, rssi, snr)) {
-      if (startsWithPacket(message, "FORWARD")) {
+    if(receiveLoRaMessage(message, rssi, snr)){
+      if(startsWithPacket(message, "EMERGENCY")){
+        handleEmergencyPacket(message, rssi, snr);
+      } else if(startsWithPacket(message, "FORWARD")){
         handleForwardPacket(message, rssi, snr);
-      } else if (startsWithPacket(message, "DONE")) {
+      } else if(startsWithPacket(message, "DONE")){
         handleDonePacket(message);
       } else {
-        Serial.println("[RX] Ignored: expected FORWARD or DONE packet");
+        Serial.println("[RX] Ignored: expected EMERGENCY, FORWARD or DONE packet");
       }
     }
   }
 
-  switch (currentState) {
+  switch(currentState){
     case START_CYCLE:
       relay1PacketCount = 0;
       relay2PacketCount = 0;
@@ -161,7 +164,7 @@ void loop() {
       break;
 
     case WAIT_RELAY1_DATA:
-      if ((unsigned long)(millis() - stateStartTime) >= RELAY1_TIMEOUT_MS) {
+      if((unsigned long)(millis()- stateStartTime)>= RELAY1_TIMEOUT_MS){
         relay1TimedOut = true;
         Serial.print("[TIMEOUT] Relay1 DONE not received within ");
         Serial.print(RELAY1_TIMEOUT_MS);
@@ -176,7 +179,7 @@ void loop() {
       break;
 
     case WAIT_RELAY2_DATA:
-      if ((unsigned long)(millis() - stateStartTime) >= RELAY2_TIMEOUT_MS) {
+      if((unsigned long)(millis()- stateStartTime)>= RELAY2_TIMEOUT_MS){
         relay2TimedOut = true;
         Serial.print("[TIMEOUT] Relay2 DONE not received within ");
         Serial.print(RELAY2_TIMEOUT_MS);
@@ -186,7 +189,7 @@ void loop() {
       break;
 
     case CYCLE_DONE:
-      if ((unsigned long)(millis() - stateStartTime) >= CYCLE_GUARD_MS) {
+      if((unsigned long)(millis()- stateStartTime)>= CYCLE_GUARD_MS){
         cycleId++;
         changeState(START_CYCLE);
       }
@@ -194,8 +197,8 @@ void loop() {
   }
 }
 
-void showOLED(String line1, String line2, String line3, String line4) {
-  if (!oledReady) {
+void showOLED(String line1, String line2, String line3, String line4){
+  if(!oledReady){
     return;
   }
 
@@ -208,13 +211,13 @@ void showOLED(String line1, String line2, String line3, String line4) {
   display.display();
 }
 
-void sendLoRaMessage(String msg) {
+void sendLoRaMessage(String msg){
   // 송신 전 standby로 전환하고, 송신 완료 후 다시 수신 모드로 복귀한다.
   LoRa.idle();
   LoRa.beginPacket();
   LoRa.print(msg);
 
-  if (LoRa.endPacket() == 1) {
+  if(LoRa.endPacket()== 1){
     Serial.print("[TX] ");
     Serial.println(msg);
   } else {
@@ -224,15 +227,15 @@ void sendLoRaMessage(String msg) {
   LoRa.receive();
 }
 
-bool receiveLoRaMessage(String &msg, int &rssi, float &snr) {
+bool receiveLoRaMessage(String &msg, int &rssi, float &snr){
   int packetSize = LoRa.parsePacket();
-  if (packetSize == 0) {
+  if(packetSize == 0){
     return false;
   }
 
   msg = "";
-  while (LoRa.available()) {
-    msg += (char)LoRa.read();
+  while(LoRa.available()){
+    msg +=(char)LoRa.read();
   }
   msg.trim();
 
@@ -250,23 +253,23 @@ bool receiveLoRaMessage(String &msg, int &rssi, float &snr) {
   return true;
 }
 
-bool startsWithPacket(String msg, String type) {
+bool startsWithPacket(String msg, String type){
   msg.trim();
   type.trim();
   return msg == type || msg.startsWith(type + ",");
 }
 
-String getField(String msg, int index) {
-  if (index < 0) {
+String getField(String msg, int index){
+  if(index < 0){
     return "";
   }
 
   int fieldStart = 0;
   int currentIndex = 0;
 
-  for (int i = 0; i <= msg.length(); i++) {
-    if (i == msg.length() || msg.charAt(i) == ',') {
-      if (currentIndex == index) {
+  for(int i = 0; i <= msg.length(); i++){
+    if(i == msg.length()|| msg.charAt(i)== ','){
+      if(currentIndex == index){
         String field = msg.substring(fieldStart, i);
         field.trim();
         return field;
@@ -280,7 +283,7 @@ String getField(String msg, int index) {
   return "";
 }
 
-void sendSchedulePacket() {
+void sendSchedulePacket(){
   // SCHEDULE,cycle_id,relay_count,runner_count,runner_slot_ms
   String message = "SCHEDULE,";
   message += String(cycleId);
@@ -294,7 +297,7 @@ void sendSchedulePacket() {
   sendLoRaMessage(message);
 }
 
-void sendRelay2StartPacket() {
+void sendRelay2StartPacket(){
   // SEND_NOW,cycle_id,target_relay_id
   String message = "SEND_NOW,";
   message += String(cycleId);
@@ -307,29 +310,29 @@ void sendRelay2StartPacket() {
   sendLoRaMessage(message);
 }
 
-void handleForwardPacket(String msg, int rssi, float snr) {
+void handleForwardPacket(String msg, int rssi, float snr){
   // FORWARD,cycle_id,relay_id,runner_id,lat,lng,pace,battery,seq,rssi,snr
-  if (getField(msg, 0) != "FORWARD" ||
-      getField(msg, 1).length() == 0 ||
-      getField(msg, 2).length() == 0 ||
-      getField(msg, 3).length() == 0 ||
-      getField(msg, 4).length() == 0 ||
-      getField(msg, 5).length() == 0 ||
-      getField(msg, 6).length() == 0 ||
-      getField(msg, 7).length() == 0 ||
-      getField(msg, 8).length() == 0 ||
-      getField(msg, 9).length() == 0 ||
-      getField(msg, 10).length() == 0 ||
-      getField(msg, 11).length() != 0) {
+  if(getField(msg, 0)!= "FORWARD" ||
+      getField(msg, 1).length()== 0 ||
+      getField(msg, 2).length()== 0 ||
+      getField(msg, 3).length()== 0 ||
+      getField(msg, 4).length()== 0 ||
+      getField(msg, 5).length()== 0 ||
+      getField(msg, 6).length()== 0 ||
+      getField(msg, 7).length()== 0 ||
+      getField(msg, 8).length()== 0 ||
+      getField(msg, 9).length()== 0 ||
+      getField(msg, 10).length()== 0 ||
+      getField(msg, 11).length()!= 0){
     Serial.println("[FORWARD][ERROR] Invalid CSV format");
     return;
   }
 
-  unsigned long packetCycleId = (unsigned long)getField(msg, 1).toInt();
+  unsigned long packetCycleId =(unsigned long)getField(msg, 1).toInt();
   int relayId = getField(msg, 2).toInt();
   int runnerId = getField(msg, 3).toInt();
 
-  if (packetCycleId != cycleId) {
+  if(packetCycleId != cycleId){
     Serial.print("[FORWARD] Ignored: packet cycle ");
     Serial.print(packetCycleId);
     Serial.print(" does not match active cycle ");
@@ -338,8 +341,8 @@ void handleForwardPacket(String msg, int rssi, float snr) {
   }
 
   int expectedRelayId =
-      (currentState == WAIT_RELAY1_DATA) ? RELAY1_ID : RELAY2_ID;
-  if (relayId != expectedRelayId) {
+     (currentState == WAIT_RELAY1_DATA)? RELAY1_ID : RELAY2_ID;
+  if(relayId != expectedRelayId){
     Serial.print("[FORWARD] Ignored: expected relay ");
     Serial.print(expectedRelayId);
     Serial.print(", received relay ");
@@ -347,9 +350,9 @@ void handleForwardPacket(String msg, int rssi, float snr) {
     return;
   }
 
-  if (relayId == RELAY1_ID) {
+  if(relayId == RELAY1_ID){
     relay1PacketCount++;
-  } else if (relayId == RELAY2_ID) {
+  } else if(relayId == RELAY2_ID){
     relay2PacketCount++;
   }
 
@@ -385,34 +388,34 @@ void handleForwardPacket(String msg, int rssi, float snr) {
   updateWaitingOLED();
 }
 
-void handleDonePacket(String msg) {
+void handleDonePacket(String msg){
   // DONE,cycle_id,relay_id,count
-  if (getField(msg, 0) != "DONE" ||
-      getField(msg, 1).length() == 0 ||
-      getField(msg, 2).length() == 0 ||
-      getField(msg, 3).length() == 0 ||
-      getField(msg, 4).length() != 0) {
+  if(getField(msg, 0)!= "DONE" ||
+      getField(msg, 1).length()== 0 ||
+      getField(msg, 2).length()== 0 ||
+      getField(msg, 3).length()== 0 ||
+      getField(msg, 4).length()!= 0){
     Serial.println("[DONE][ERROR] Invalid CSV format");
     return;
   }
 
-  unsigned long packetCycleId = (unsigned long)getField(msg, 1).toInt();
+  unsigned long packetCycleId =(unsigned long)getField(msg, 1).toInt();
   int relayId = getField(msg, 2).toInt();
   int count = getField(msg, 3).toInt();
 
-  if (packetCycleId != cycleId || count < 0) {
+  if(packetCycleId != cycleId || count < 0){
     Serial.println("[DONE] Ignored: invalid cycle_id or count");
     return;
   }
 
-  if (currentState == WAIT_RELAY1_DATA && relayId == RELAY1_ID) {
+  if(currentState == WAIT_RELAY1_DATA && relayId == RELAY1_ID){
     relay1DoneCount = count;
     Serial.print("[DONE] Relay1 complete. Reported count=");
     Serial.print(relay1DoneCount);
     Serial.print(", received FORWARD count=");
     Serial.println(relay1PacketCount);
 
-    if (relay1DoneCount != relay1PacketCount) {
+    if(relay1DoneCount != relay1PacketCount){
       Serial.println("[DONE][WARN] Relay1 reported count differs from received count");
     }
 
@@ -420,14 +423,14 @@ void handleDonePacket(String msg) {
     return;
   }
 
-  if (currentState == WAIT_RELAY2_DATA && relayId == RELAY2_ID) {
+  if(currentState == WAIT_RELAY2_DATA && relayId == RELAY2_ID){
     relay2DoneCount = count;
     Serial.print("[DONE] Relay2 complete. Reported count=");
     Serial.print(relay2DoneCount);
     Serial.print(", received FORWARD count=");
     Serial.println(relay2PacketCount);
 
-    if (relay2DoneCount != relay2PacketCount) {
+    if(relay2DoneCount != relay2PacketCount){
       Serial.println("[DONE][WARN] Relay2 reported count differs from received count");
     }
 
@@ -441,8 +444,8 @@ void handleDonePacket(String msg) {
   Serial.println(stateName(currentState));
 }
 
-void changeState(GatewayState nextState) {
-  if (currentState != nextState) {
+void changeState(GatewayState nextState){
+  if(currentState != nextState){
     Serial.print("[STATE] ");
     Serial.print(stateName(currentState));
     Serial.print(" -> ");
@@ -452,9 +455,9 @@ void changeState(GatewayState nextState) {
   currentState = nextState;
   stateStartTime = millis();
 
-  if (nextState == WAIT_RELAY1_DATA || nextState == WAIT_RELAY2_DATA) {
+  if(nextState == WAIT_RELAY1_DATA || nextState == WAIT_RELAY2_DATA){
     updateWaitingOLED();
-  } else if (nextState == CYCLE_DONE) {
+  } else if(nextState == CYCLE_DONE){
     Serial.println("----------------------------------------");
     Serial.print("[RESULT] Cycle ");
     Serial.println(cycleId);
@@ -482,8 +485,73 @@ void changeState(GatewayState nextState) {
   }
 }
 
-const char *stateName(GatewayState state) {
-  switch (state) {
+void handleEmergencyPacket(String msg, int rssi, float snr){
+  // EMERGENCY,cycle_id,relay_id,runner_id,lat,lng,pace,battery,status,seq,runner_rssi,runner_snr
+
+  if(getField(msg, 0) != "EMERGENCY" ||
+     getField(msg, 1).length() == 0 ||
+     getField(msg, 2).length() == 0 ||
+     getField(msg, 3).length() == 0 ||
+     getField(msg, 4).length() == 0 ||
+     getField(msg, 5).length() == 0 ||
+     getField(msg, 6).length() == 0 ||
+     getField(msg, 7).length() == 0 ||
+     getField(msg, 8).length() == 0 ||
+     getField(msg, 9).length() == 0 ||
+     getField(msg, 10).length() == 0 ||
+     getField(msg, 11).length() == 0 ||
+     getField(msg, 12).length() != 0){
+    Serial.println("[EMERGENCY][ERROR] Invalid CSV format");
+    return;
+  }
+
+  unsigned long packetCycleId = (unsigned long)getField(msg, 1).toInt();
+  int relayId = getField(msg, 2).toInt();
+  int runnerId = getField(msg, 3).toInt();
+
+  Serial.println();
+  Serial.println("🚨 [EMERGENCY RECEIVED]");
+  Serial.print("  cycle_id: ");
+  Serial.println(packetCycleId);
+  Serial.print("  relay_id: ");
+  Serial.println(relayId);
+  Serial.print("  runner_id: ");
+  Serial.println(runnerId);
+
+  Serial.print("  lat/lng: ");
+  Serial.print(getField(msg, 4));
+  Serial.print(", ");
+  Serial.println(getField(msg, 5));
+
+  Serial.print("  pace/battery/status/seq: ");
+  Serial.print(getField(msg, 6));
+  Serial.print(" / ");
+  Serial.print(getField(msg, 7));
+  Serial.print(" / ");
+  Serial.print(getField(msg, 8));
+  Serial.print(" / ");
+  Serial.println(getField(msg, 9));
+
+  Serial.print("  Runner-to-Relay RSSI/SNR: ");
+  Serial.print(getField(msg, 10));
+  Serial.print(" dBm / ");
+  Serial.print(getField(msg, 11));
+  Serial.println(" dB");
+
+  Serial.print("  Relay-to-Gateway RSSI/SNR: ");
+  Serial.print(rssi);
+  Serial.print(" dBm / ");
+  Serial.print(snr, 2);
+  Serial.println(" dB");
+
+  showOLED("!!! EMERGENCY !!!",
+           "Runner: " + String(runnerId),
+           "Relay: " + String(relayId),
+           getField(msg, 4) + "," + getField(msg, 5));
+}
+
+const char *stateName(GatewayState state){
+  switch(state){
     case START_CYCLE:
       return "START_CYCLE";
     case WAIT_RELAY1_DATA:
@@ -499,9 +567,9 @@ const char *stateName(GatewayState state) {
   }
 }
 
-void updateWaitingOLED() {
+void updateWaitingOLED(){
   String stateLine =
-      (currentState == WAIT_RELAY1_DATA) ? "WAIT RELAY1" : "WAIT RELAY2";
+     (currentState == WAIT_RELAY1_DATA)? "WAIT RELAY1" : "WAIT RELAY2";
   showOLED(stateLine, "Cycle: " + String(cycleId),
            "R1 packets: " + String(relay1PacketCount),
            "R2 packets: " + String(relay2PacketCount));

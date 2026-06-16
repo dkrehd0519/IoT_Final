@@ -27,15 +27,28 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 #define LORA_CODING_RATE_DENOMINATOR 5
 #define LORA_PREAMBLE_LENGTH 8
 
-#define BEACON_COLLECTION_MS 1500UL
+#define TOTAL_RUNNERS 3
+#define GROUP_COVERAGE_M 3000.0f 
+#define RELAY_INTERVAL_M 1500.0f
+#define RELAYS_PER_GROUP 2
+#define RELAY_MAX_COUNT 2
+#define RELAY_BEACON_SLOT_MS 500UL
+#define BEACON_COLLECTION_MS \
+ ((unsigned long)RELAYS_PER_GROUP * RELAY_BEACON_SLOT_MS)
 #define PHASE_GUARD_MS 300UL
-#define MAX_RELAY_CANDIDATES 2
+#define CURRENT_RELAY_TIMEOUT_MS 30000UL
+#define MAX_RELAY_CANDIDATES RELAYS_PER_GROUP
+#define EMERGENCY_TX_TOTAL_COUNT 3
+#define EMERGENCY_RETRY_INTERVAL_MS 800UL
+#define EMERGENCY_BACKOFF_MAX_MS 200UL
+#define EMERGENCY_BROADCAST_RELAY_ID 0
 
 // for testing without actual Relay/BEACON, set DUMMY_BEACON_MODE to true to generate fake BEACON packets periodically.
-#define DUMMY_BEACON_MODE true
+#define DUMMY_BEACON_MODE false
 #define DUMMY_BEACON_INTERVAL_MS 8000UL
 #define DUMMY_RELAY_ID 1
-#define DUMMY_RUNNER_COUNT 3
+#define DUMMY_CURRENT_COUNT 3
+#define DUMMY_MAX_COUNT RELAY_MAX_COUNT
 #define DUMMY_RUNNER_SLOT_MS 2000
 
 int dummyCycleId = 1;
@@ -71,13 +84,15 @@ enum RunnerState{
 };
 
 struct RelayCandidate{
+  bool valid;
   int cycleId;
   int relayId;
-  int runnerCount;
+  int currentCount;
+  int maxCount;
   int runnerSlotMs;
   int rssi;
   float snr;
-  bool valid;
+  unsigned long lastSeen;
 };
 
 RunnerState currentState = WAIT_BEACON;
@@ -88,10 +103,12 @@ unsigned long sendTime = 0;
 int activeCycleId = -1;
 int selectedCandidateIndex = -1;
 int selectedRelayId = -1;
-int selectedRunnerCount = 0;
+int selectedCurrentCount = 0;
+int selectedMaxCount = RELAY_MAX_COUNT;
 int selectedRunnerSlotMs = 0;
 int selectedRelayRssi = 0;
 float selectedRelaySnr = 0.0;
+unsigned long selectedRelayLastSeen = 0;
 
 double lastLat = DUMMY_LAT;
 double lastLng = DUMMY_LNG;
@@ -118,7 +135,10 @@ unsigned long seq = 1;
 // interrupt flag for LoRa reception
 volatile bool receivedFlag = false;
 
-bool emergencyMode = false;
+bool emergencyPending = false;
+int emergencyTxCount = 0;
+unsigned long nextEmergencyTxTime = 0;
+unsigned long emergencySeq = 0;
 bool lastButtonState = !SOS_ACTIVE_LEVEL;
 
 void setLoRaFlag(void){
@@ -131,13 +151,24 @@ bool startsWithPacket(String msg, String type); // Parsing string packet type, e
 String getField(String msg, int index); // extract field from CSV string
 void updateGPS();
 void updateSOSButton();
+void handleEmergencyImmediate();
+void sendEmergencyDataNow(int targetRelayId, unsigned long eventSeq);
 int calculatePace();
 int readBatteryPercent();
 char getRunnerStatus();
 String getTimestamp();
 double distanceMeters(double lat1, double lon1, double lat2, double lon2); // calculate distance in meters between two GPS coordinates
-void handleBeaconPacket(String msg, int rssi, float snr); // store received BEACON packet as RelayCandidate if valid
-int selectBestRelay(); // based on RSSI and SNR
+int getRelayGroupIndex(float totalDistanceM);
+int getGroupStartRelayId(float totalDistanceM);
+int getGroupEndRelayId(float totalDistanceM);
+bool isRelayInCurrentGroup(int relayId, float totalDistanceM);
+void handleBeacon(String msg, int rssi, float snr);
+bool canUseRelayCandidate(RelayCandidate c, bool isCurrentRelay);
+float getRelayScore(RelayCandidate c);
+int selectBestRelay();
+bool shouldKeepCurrentRelay();
+void updateSelectedRelay();
+void sendHandoverPacket(int oldRelayId, int newRelayId);
 void sendRunnerStatus();
 void resetBeaconCandidates(); // when a new cycle starts, clear previous candidates and reset related variables
 void changeState(RunnerState nextState); 
@@ -232,7 +263,7 @@ void injectDummyBeaconIfNeeded(){
         return;
     }
 
-    if((unsigned long)(millis() - lastDummyBeaconTime) < DUMMY_BEACON_INTERVAL_MS){
+    if((unsigned long)(millis()- lastDummyBeaconTime)< DUMMY_BEACON_INTERVAL_MS){
         return;
     }
 
@@ -246,7 +277,9 @@ void injectDummyBeaconIfNeeded(){
     dummyBeacon1 += ",";
     dummyBeacon1 += String(1);   // relay_id = 1
     dummyBeacon1 += ",";
-    dummyBeacon1 += String(DUMMY_RUNNER_COUNT);
+    dummyBeacon1 += String(DUMMY_CURRENT_COUNT);
+    dummyBeacon1 += ",";
+    dummyBeacon1 += String(DUMMY_MAX_COUNT);
     dummyBeacon1 += ",";
     dummyBeacon1 += String(DUMMY_RUNNER_SLOT_MS);
 
@@ -259,7 +292,9 @@ void injectDummyBeaconIfNeeded(){
     dummyBeacon2 += ",";
     dummyBeacon2 += String(2);   // relay_id = 2
     dummyBeacon2 += ",";
-    dummyBeacon2 += String(DUMMY_RUNNER_COUNT);
+    dummyBeacon2 += String(DUMMY_CURRENT_COUNT + 20);
+    dummyBeacon2 += ",";
+    dummyBeacon2 += String(DUMMY_MAX_COUNT);
     dummyBeacon2 += ",";
     dummyBeacon2 += String(DUMMY_RUNNER_SLOT_MS);
 
@@ -276,7 +311,7 @@ void injectDummyBeaconIfNeeded(){
     Serial.print(", SNR=");
     Serial.println(fakeSnr1);
 
-    handleBeaconPacket(dummyBeacon1, fakeRssi1, fakeSnr1);
+    handleBeacon(dummyBeacon1, fakeRssi1, fakeSnr1);
 
     Serial.print("[DUMMY] ");
     Serial.print(dummyBeacon2);
@@ -285,7 +320,7 @@ void injectDummyBeaconIfNeeded(){
     Serial.print(", SNR=");
     Serial.println(fakeSnr2);
 
-    handleBeaconPacket(dummyBeacon2, fakeRssi2, fakeSnr2);
+    handleBeacon(dummyBeacon2, fakeRssi2, fakeSnr2);
 
     dummyCycleId++;
 }
@@ -295,9 +330,10 @@ void loop(){
     //so that the latest position is available when it's time to send.
     updateGPS();
     updateSOSButton();
+    handleEmergencyImmediate();
 
     // testing function to simulate receiving BEACON packets without actual Relay hardware.
-    injectDummyBeaconIfNeeded();
+    // injectDummyBeaconIfNeeded();
 
     // Check the beacon only when in WAIT_BEACON or SELECT_RELAY state.
     if(currentState == WAIT_BEACON || currentState == SELECT_RELAY){
@@ -308,7 +344,7 @@ void loop(){
         if(receiveLoRaMessage(message, rssi, snr)){
             // If it's a BEACON packet, process it to collect Relay candidates. Otherwise, ignore.
             if(startsWithPacket(message, "BEACON")){
-                handleBeaconPacket(message, rssi, snr);
+                handleBeacon(message, rssi, snr);
             }else{
                 Serial.println("[RX] Ignored: packet type is not BEACON");
             }
@@ -327,29 +363,14 @@ void loop(){
             then select the best Relay based on RSSI/SNR.
             */ 
             if((unsigned long)(millis()- firstBeaconTime)>= BEACON_COLLECTION_MS){
-                selectedCandidateIndex = selectBestRelay();
+                updateSelectedRelay();
                 
                 // If tehre are no candidates, skip to the end of the cycle and wait for the next BEACON.
-                if(selectedCandidateIndex < 0){
+                if(selectedRelayId <= 0){
                     Serial.println("[SELECT] No valid BEACON. Skip this cycle.");
                     changeState(CYCLE_DONE);
                     break;
                 }
-
-                RelayCandidate &selected = relayCandidates[selectedCandidateIndex];
-                selectedRelayId = selected.relayId;
-                selectedRunnerCount = selected.runnerCount;
-                selectedRunnerSlotMs = selected.runnerSlotMs;
-                selectedRelayRssi = selected.rssi;
-                selectedRelaySnr = selected.snr;
-
-                Serial.print("[SELECT] Relay ");
-                Serial.print(selectedRelayId);
-                Serial.print(" selected by RSSI/SNR, RSSI=");
-                Serial.print(selected.rssi);
-                Serial.print(" dBm, SNR=");
-                Serial.print(selected.snr, 2);
-                Serial.println(" dB");
 
                 // Checking the validity of the selected candidate's parameters.
                 if(RUNNER_ID < 1){
@@ -358,27 +379,17 @@ void loop(){
                     break;
                 }
 
-                if(selectedRunnerCount <= 0 || selectedRunnerSlotMs <= 0){
-                    Serial.println("[ERROR] Invalid runner_count or runner_slot_ms. Transmission skipped.");
+                if(selectedMaxCount <= 0 || selectedRunnerSlotMs <= 0){
+                    Serial.println("[ERROR] Invalid max_count or runner_slot_ms. Transmission skipped.");
                     changeState(CYCLE_DONE);
                     break;
                 }
 
-                if(RUNNER_ID > selectedRunnerCount){
-                    Serial.print("[WARN] RUNNER_ID ");
-                    Serial.print(RUNNER_ID);
-                    Serial.print(" exceeds runner_count ");
-                    Serial.println(selectedRunnerCount);
-                    Serial.println("[WARN] No assigned slot; transmission skipped to avoid collision.");
-                    changeState(CYCLE_DONE);
-                    break;
-                }
-                
-                // Calculating the slot
-                unsigned long slotIndex =(unsigned long)(RUNNER_ID - 1);
+                unsigned long slotIndex =
+                   (unsigned long)((RUNNER_ID - 1)% selectedMaxCount);
                 unsigned long mySlotDelay = slotIndex *(unsigned long)selectedRunnerSlotMs;
 
-                // The time to send the RUNNER status. (the first BEACON time + collection period + guard time + my slot delay)
+                // The time to send the RUNNER status.(the first BEACON time + collection period + guard time + my slot delay)
                 sendTime = firstBeaconTime + BEACON_COLLECTION_MS + PHASE_GUARD_MS + mySlotDelay;
 
                 Serial.print("[SLOT] index=");
@@ -520,7 +531,7 @@ void updateGPS(){
     }
 
     // if the GPS location is not valid, return without updating the position.
-    if(!gps.location.isValid()) return;
+    if(!gps.location.isValid())return;
 
     // Update the last known valid GPS position and time.
     double newLat = gps.location.lat();
@@ -554,25 +565,25 @@ void updateGPS(){
     double movedM = distanceMeters(prevLat, prevLng, newLat, newLng);
     unsigned long dtMs = nowMs - prevGpsMillis;
 
-    if(dtMs == 0) return;
+    if(dtMs == 0)return;
 
     double elapsedSec = dtMs / 1000.0;
     double speedMps = movedM / elapsedSec;
     
-    if(movedM < 1.0) return;  // ignore small movements 
-    if(movedM > 50.0) return; // ignore large jumps
-    if(speedMps < 0.1) return; // ignore slow speed 
-    if(speedMps > 8.0) return; // ignore fast speed
+    if(movedM < 1.0)return;  // ignore small movements
+    if(movedM > 50.0)return; // ignore large jumps
+    if(speedMps < 0.1)return; // ignore slow speed
+    if(speedMps > 8.0)return; // ignore fast speed
 
     totalDistanceM += movedM; // accumulate total distance
-    currentPaceSecPerKm = (int)(1000.0 / speedMps); // pace between last two points
+    currentPaceSecPerKm =(int)(1000.0 / speedMps); // pace between last two points
 
     // for average pace
     double totalKm = totalDistanceM / 1000.0;
-    double elapsedRunSec = (nowMs - runStartMillis) / 1000.0;
+    double elapsedRunSec =(nowMs - runStartMillis)/ 1000.0;
 
     if(totalKm > 0.01){
-        avgPaceSecPerKm = (int)(elapsedRunSec / totalKm);
+        avgPaceSecPerKm =(int)(elapsedRunSec / totalKm);
     }
 
     prevLat = newLat;
@@ -580,7 +591,7 @@ void updateGPS(){
     prevGpsMillis = nowMs;
 }
 
-// return the average pace (send to Relay)
+// return the average pace(send to Relay)
 int calculatePace(){
   return avgPaceSecPerKm;
 }
@@ -593,49 +604,87 @@ int readBatteryPercent(){
   return 78;
 }
 
-// Check the SOS button state and update the emergency mode accordingly.
-void updateSOSButton() {
+// Detect only the first pressed edge and create one emergency event.
+void updateSOSButton(){
   int currentButtonState = digitalRead(SOS_BUTTON_PIN);
 
-  // detect the moment when the button is just pressed
   if(currentButtonState == SOS_ACTIVE_LEVEL && lastButtonState != SOS_ACTIVE_LEVEL){
-    // emergencyMode = true; // for mode1, 2
-
-    // for mode 3 (toggle)
-    emergencyMode = !emergencyMode; 
-    if(emergencyMode){
-      Serial.println("[SOS] Emergency activated");
-    }else{
-      Serial.println("[SOS] Emergency cancelled");
+    if(!emergencyPending){
+      emergencyPending = true;
+      emergencyTxCount = 0;
+      emergencySeq++;
+      nextEmergencyTxTime =
+          millis() + random(0, EMERGENCY_BACKOFF_MAX_MS);
+      Serial.println("[SOS] Emergency one-shot event triggered");
     }
-
-    Serial.println("[SOS] Emergency activated");
   }
 
   lastButtonState = currentButtonState;
 }
 
 char getRunnerStatus(){
-  // for mode 1
-  // int buttonValue = digitalRead(SOS_BUTTON_PIN);
-  // if(buttonValue == SOS_ACTIVE_LEVEL){
-  //   return 'E';
-  // }
+  return 'M';
+}
 
-  // for mode 2
-  // if(emergencyMode){
-  //   emergencyMode = false; 
-  //   return 'E';
-  // }
-
-  // for mode 3
-  if(emergencyMode){
-    emergencyMode = false; 
-    return 'E';
+void handleEmergencyImmediate(){
+  if(!emergencyPending){
+    return;
   }
 
-  return 'M';
+  if(emergencyTxCount >= EMERGENCY_TX_TOTAL_COUNT){
+    emergencyPending = false;
+    Serial.println("[EMERGENCY] Emergency burst finished");
+    return;
+  }
 
+  if((long)(millis() - nextEmergencyTxTime) < 0){
+    return;
+  }
+
+  int targetRelayId = selectedRelayId;
+  if(targetRelayId <= 0){
+    targetRelayId = EMERGENCY_BROADCAST_RELAY_ID;
+  }
+
+  sendEmergencyDataNow(targetRelayId, emergencySeq);
+  emergencyTxCount++;
+  nextEmergencyTxTime =
+      millis() + EMERGENCY_RETRY_INTERVAL_MS +
+      random(0, EMERGENCY_BACKOFF_MAX_MS);
+}
+
+void sendEmergencyDataNow(int targetRelayId, unsigned long eventSeq){
+  int pace = calculatePace();
+  int battery = readBatteryPercent();
+
+  String message = "DATA,";
+  message += String(activeCycleId);
+  message += ",";
+  message += String(RUNNER_ID);
+  message += ",";
+  message += String(targetRelayId);
+  message += ",";
+  message += String(lastLat, 6);
+  message += ",";
+  message += String(lastLng, 6);
+  message += ",";
+  message += String(pace);
+  message += ",";
+  message += String(battery);
+  message += ",";
+  message += String(eventSeq);
+  message += ",";
+  message += gpsValid ? "1" : "0";
+  message += ",E";
+
+  Serial.print("[EMERGENCY][IMMEDIATE_TX] count=");
+  Serial.print(emergencyTxCount + 1);
+  Serial.print("/");
+  Serial.print(EMERGENCY_TX_TOTAL_COUNT);
+  Serial.print(", ");
+  Serial.println(message);
+
+  sendLoRaMessage(message);
 }
 
 String getTimestamp(){
@@ -677,30 +726,71 @@ double distanceMeters(double lat1, double lon1, double lat2, double lon2){
   return R * c;
 }
 
-void handleBeaconPacket(String msg, int rssi, float snr){
-  // BEACON,cycle_id,relay_id,runner_count,runner_slot_ms
+// set a Groupt Index based on the total distance.
+int getRelayGroupIndex(float distanceM){
+  /*
+  0~10km   → groupIndex 0
+  10~20km  → groupIndex 1
+  20~30km  → groupIndex 2
+  */
+  if(distanceM < 0.0f)return 0;
+
+  return(int)(distanceM / GROUP_COVERAGE_M);
+}
+
+// Get the start Relay ID of the current group based on the total distance.
+int getGroupStartRelayId(float distanceM){
+  return getRelayGroupIndex(distanceM)* RELAYS_PER_GROUP + 1;
+}
+
+// Get the end Relay ID of the current group based on the total distance.
+int getGroupEndRelayId(float distanceM){
+  return getGroupStartRelayId(distanceM)+ RELAYS_PER_GROUP - 1;
+}
+
+// Check if the given Relay ID belongs to the current group
+bool isRelayInCurrentGroup(int relayId, float distanceM){
+  return relayId >= getGroupStartRelayId(distanceM)&&
+         relayId <= getGroupEndRelayId(distanceM);
+}
+
+void handleBeacon(String msg, int rssi, float snr){
+  // BEACON,cycle_id,relay_id,currentCount,maxCount,runnerSlotMs
   String cycleField = getField(msg, 1);
   String relayField = getField(msg, 2);
-  String countField = getField(msg, 3);
-  String slotField = getField(msg, 4);
+  String currentCountField = getField(msg, 3);
+  String maxCountField = getField(msg, 4);
+  String slotField = getField(msg, 5);
 
   if(getField(msg, 0)!= "BEACON" ||
       cycleField.length()== 0 ||
       relayField.length()== 0 ||
-      countField.length()== 0 ||
+      currentCountField.length()== 0 ||
+      maxCountField.length()== 0 ||
       slotField.length()== 0 ||
-      getField(msg, 5).length()!= 0){
+      getField(msg, 6).length()!= 0){
     Serial.println("[BEACON][ERROR] Invalid CSV format");
     return;
   }
 
   int cycleId = cycleField.toInt();
   int relayId = relayField.toInt();
-  int runnerCount = countField.toInt();
+  int currentCount = currentCountField.toInt();
+  int maxCount = maxCountField.toInt();
   int runnerSlotMs = slotField.toInt();
 
-  if(cycleId < 0 || relayId <= 0 || runnerCount <= 0 || runnerSlotMs <= 0){
+  if(cycleId < 0 || relayId <= 0 || currentCount < 0 ||
+      maxCount <= 0 || runnerSlotMs <= 0){
     Serial.println("[BEACON][ERROR] Invalid field value");
+    return;
+  }
+
+  // 이 부분 다시 체크
+  if(!isRelayInCurrentGroup(relayId, totalDistanceM)){
+    Serial.print("[BEACON] Ignored relay ");
+    Serial.print(relayId);
+    Serial.print(": current group is ");
+    Serial.println(getRelayGroupIndex(totalDistanceM)+ 1);
     return;
   }
 
@@ -753,16 +843,16 @@ void handleBeaconPacket(String msg, int rssi, float snr){
     RelayCandidate &existing = relayCandidates[candidateIndex];
 
     if(rssi > existing.rssi ||(rssi == existing.rssi && snr > existing.snr)){
-      existing.runnerCount = runnerCount;
-      existing.runnerSlotMs = runnerSlotMs;
       existing.rssi = rssi;
       existing.snr = snr;
+    }
+    existing.currentCount = currentCount;
+    existing.maxCount = maxCount;
+    existing.runnerSlotMs = runnerSlotMs;
+    existing.lastSeen = millis();
 
-      Serial.print("[BEACON] Duplicate updated with stronger signal: relay ");
-      Serial.println(relayId);
-    }else{
-      Serial.print("[BEACON] Duplicate kept existing stronger signal: relay ");
-      Serial.println(relayId);
+    if(relayId == selectedRelayId){
+      selectedRelayLastSeen = existing.lastSeen;
     }
 
     return;
@@ -776,41 +866,59 @@ void handleBeaconPacket(String msg, int rssi, float snr){
   }
 
   RelayCandidate &candidate = relayCandidates[emptyIndex];
+  candidate.valid = true;
   candidate.cycleId = cycleId;
   candidate.relayId = relayId;
-  candidate.runnerCount = runnerCount;
+  candidate.currentCount = currentCount;
+  candidate.maxCount = maxCount;
   candidate.runnerSlotMs = runnerSlotMs;
   candidate.rssi = rssi;
   candidate.snr = snr;
-  candidate.valid = true;
+  candidate.lastSeen = millis();
 
-  Serial.print("[BEACON] Saved candidate: cycle=");
-  Serial.print(cycleId);
-  Serial.print(", relay=");
+  if(relayId == selectedRelayId){
+    selectedRelayLastSeen = candidate.lastSeen;
+  }
+
+  Serial.print("[BEACON] relay=");
   Serial.print(relayId);
-  Serial.print(", runners=");
-  Serial.print(runnerCount);
-  Serial.print(", slot=");
-  Serial.print(runnerSlotMs);
-  Serial.print(" ms, RSSI=");
+  Serial.print(", count=");
+  Serial.print(currentCount);
+  Serial.print("/");
+  Serial.print(maxCount);
+  Serial.print(", RSSI=");
   Serial.print(rssi);
   Serial.print(", SNR=");
   Serial.println(snr, 2);
+}
+
+bool canUseRelayCandidate(RelayCandidate candidate, bool isCurrentRelay){
+  if(!candidate.valid)return false;
+  if(candidate.cycleId != activeCycleId)return false;
+  if(!isRelayInCurrentGroup(candidate.relayId, totalDistanceM))return false;
+  if(candidate.maxCount <= 0)return false;
+
+  if(isCurrentRelay)return candidate.currentCount <= candidate.maxCount;
+
+  return candidate.currentCount < candidate.maxCount;
+}
+
+// A scoring function to evaluate the Relay candidates based on RSSI, SNR, and load ratio.
+float getRelayScore(RelayCandidate candidate){
+  float loadRatio =(float)candidate.currentCount /(float)candidate.maxCount;
+  return candidate.rssi * 1.0f + candidate.snr * 2.0f - loadRatio * 20.0f;
 }
 
 int selectBestRelay(){
   int bestIndex = -1;
 
   for(int i = 0; i < MAX_RELAY_CANDIDATES; i++){
-    if(!relayCandidates[i].valid ||
-        relayCandidates[i].cycleId != activeCycleId){
+    bool isCurrentRelay = relayCandidates[i].relayId == selectedRelayId;
+    if(!canUseRelayCandidate(relayCandidates[i], isCurrentRelay)){
       continue;
     }
 
-    if(bestIndex < 0 ||
-        relayCandidates[i].rssi > relayCandidates[bestIndex].rssi ||
-       (relayCandidates[i].rssi == relayCandidates[bestIndex].rssi &&
-         relayCandidates[i].snr > relayCandidates[bestIndex].snr)){
+    if(bestIndex < 0 || getRelayScore(relayCandidates[i])> getRelayScore(relayCandidates[bestIndex])){
       bestIndex = i;
     }
   }
@@ -818,8 +926,84 @@ int selectBestRelay(){
   return bestIndex;
 }
 
+bool shouldKeepCurrentRelay(){
+  if(selectedRelayId <= 0 || !isRelayInCurrentGroup(selectedRelayId, totalDistanceM)){
+    return false;
+  }
+
+  for(int i = 0; i < MAX_RELAY_CANDIDATES; i++){
+    if(relayCandidates[i].valid && relayCandidates[i].relayId == selectedRelayId){
+      return canUseRelayCandidate(relayCandidates[i], true);
+    }
+  }
+
+  return selectedRelayLastSeen > 0 &&(unsigned long)(millis()- selectedRelayLastSeen)< CURRENT_RELAY_TIMEOUT_MS;
+}
+
+void updateSelectedRelay(){
+  if(shouldKeepCurrentRelay()){
+    for(int i = 0; i < MAX_RELAY_CANDIDATES; i++){
+      if(relayCandidates[i].valid &&
+         relayCandidates[i].relayId == selectedRelayId){
+        selectedCandidateIndex = i;
+        selectedCurrentCount = relayCandidates[i].currentCount;
+        selectedMaxCount = relayCandidates[i].maxCount;
+        selectedRunnerSlotMs = relayCandidates[i].runnerSlotMs;
+        selectedRelayRssi = relayCandidates[i].rssi;
+        selectedRelaySnr = relayCandidates[i].snr;
+        break;
+      }
+    }
+    Serial.print("[RELAY_SELECT] Keep relay ");
+    Serial.println(selectedRelayId);
+    return;
+  }
+
+  int oldRelayId = selectedRelayId;
+  int bestIndex = selectBestRelay();
+  if(bestIndex < 0){
+    selectedCandidateIndex = -1;
+    selectedRelayId = -1;
+    return;
+  }
+
+  RelayCandidate &selected = relayCandidates[bestIndex];
+  if(oldRelayId > 0 && oldRelayId != selected.relayId){
+    sendHandoverPacket(oldRelayId, selected.relayId);
+  }
+
+  selectedCandidateIndex = bestIndex;
+  selectedRelayId = selected.relayId;
+  selectedCurrentCount = selected.currentCount;
+  selectedMaxCount = selected.maxCount;
+  selectedRunnerSlotMs = selected.runnerSlotMs;
+  selectedRelayRssi = selected.rssi;
+  selectedRelaySnr = selected.snr;
+  selectedRelayLastSeen = selected.lastSeen;
+
+  Serial.print("[RELAY_SELECT] Selected relay ");
+  Serial.print(selectedRelayId);
+  Serial.print(", score=");
+  Serial.println(getRelayScore(selected), 2);
+}
+
+void sendHandoverPacket(int oldRelayId, int newRelayId){
+  String message = "HANDOVER,";
+  message += String(activeCycleId);
+  message += ",";
+  message += String(RUNNER_ID);
+  message += ",";
+  message += String(oldRelayId);
+  message += ",";
+  message += String(newRelayId);
+
+  Serial.print("[SEND_HANDOVER] ");
+  Serial.println(message);
+  sendLoRaMessage(message);
+}
+
 void sendRunnerStatus(){
-  if(selectedCandidateIndex < 0 || selectedRelayId <= 0){
+  if(selectedRelayId <= 0){
     Serial.println("[TX][ERROR] No selected Relay. Transmission cancelled.");
     return;
   }
@@ -828,31 +1012,27 @@ void sendRunnerStatus(){
   int battery = readBatteryPercent();
   char status = getRunnerStatus();
 
-  // RUNNER,cycle_id,runner_id,target_relay_id,lat,lng,pace,battery,seq,gps_valid
-  String message = "RUNNER,";
+  // DATA,cycle_id,runner_id,selectedRelayId,lat,lng,pace,battery,seq,gps_valid,status
+  String message = "DATA,";
   message += String(activeCycleId);
   message += ",";
   message += String(RUNNER_ID);
   message += ",";
   message += String(selectedRelayId);
   message += ",";
-  message += String(lastLat, 5);
+  message += String(lastLat, 6);
   message += ",";
-  message += String(lastLng, 5);
+  message += String(lastLng, 6);
   message += ",";
   message += String(pace);
   message += ",";
   message += String(battery);
   message += ",";
-  message += String(status);
-  message += ",";
   message += String(seq);
   message += ",";
-  message += ",";
-  message += String(selectedRelayRssi);
-  message += ",";
-  message += String(selectedRelaySnr, 2);
   message += gpsValid ? "1" : "0";
+  message += ",";
+  message += String(status);
 
   Serial.print("[GPS] valid=");
   Serial.print(gpsValid ? 1 : 0);
@@ -885,10 +1065,12 @@ void resetBeaconCandidates(){
   for(int i = 0; i < MAX_RELAY_CANDIDATES; i++){
     relayCandidates[i].cycleId = -1;
     relayCandidates[i].relayId = -1;
-    relayCandidates[i].runnerCount = 0;
+    relayCandidates[i].currentCount = 0;
+    relayCandidates[i].maxCount = 0;
     relayCandidates[i].runnerSlotMs = 0;
     relayCandidates[i].rssi = -999;
     relayCandidates[i].snr = -999.0;
+    relayCandidates[i].lastSeen = 0;
     relayCandidates[i].valid = false;
   }
 
@@ -896,9 +1078,6 @@ void resetBeaconCandidates(){
   sendTime = 0;
   activeCycleId = -1;
   selectedCandidateIndex = -1;
-  selectedRelayId = -1;
-  selectedRunnerCount = 0;
-  selectedRunnerSlotMs = 0;
 }
 
 void changeState(RunnerState nextState){
