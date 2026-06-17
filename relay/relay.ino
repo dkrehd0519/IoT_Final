@@ -19,8 +19,8 @@
 // 데모 실행 시 Relay 장치마다 아래 값을 변경한다.
 #define DEMO_SCENARIO 1
 #define RELAY_ID 1
-#define SECTION_ID 1
-#define CHANNEL_ID 1
+#define SECTION_ID 2
+#define CHANNEL_ID 2
 #define TEST_MODE true
 
 #define LORA_FREQUENCY 915E6
@@ -43,12 +43,15 @@ const long CHANNEL_FREQ_HZ[] = {
 #define TOTAL_RUNNERS 3
 #define MAX_ACTIVE_RUNNERS 6
 #define MAX_BUFFER_SIZE 8
-#define MAX_HANDOVER_REQUESTS 4
-#define MAX_PENDING_UPDATES 4
+#define MAX_HANDOVER_REQUESTS 8
+#define MAX_PENDING_UPDATES 8
 #define SLOT_DURATION_MS 900UL
 #define PHASE_GUARD_MS 250UL
 #define CYCLE_GUARD_MS 1400UL
 #define RESPONSE_GAP_MS 250UL
+#define TARGET_RELAY_START_ID 7
+#define TARGET_RELAY_COUNT 6
+#define DEMO_VIRTUAL_TARGET_GROUP true
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool oledReady = false;
@@ -118,7 +121,7 @@ int currentChannelId = CHANNEL_ID;
 int currentSectionId = SECTION_ID;
 int reserveSlotCount = 0;
 int approvedRunnerId = -1;
-int nextHandoverRelayPointer = 2;
+int nextHandoverRelayPointer = TARGET_RELAY_START_ID;
 
 void showOLED(String line1, String line2 = "", String line3 = "", String line4 = "");
 void sendLoRaMessage(String msg);
@@ -148,8 +151,10 @@ void addRunnerDataToBuffer(int cycle, int runnerId, String lat, String lng,
 void addHandoverRequest(int runnerId, unsigned long requestTime);
 void processHandoverRequests();
 int getNextHandoverRelayId();
-int getNextHandoverChannelId();
-void prepareAckForRunner(int runnerId, int nextRelayId, int nextChannelId);
+int getNextHandoverChannelId(int nextRelayId);
+bool isVirtualTargetRelayId(int relayId);
+void prepareAckForRunner(int runnerId, int nextRelayId, int nextChannelId,
+                         int reserveSlotId);
 void prepareRetryForRunner(int runnerId);
 void sendNextHandoverResponseIfNeeded();
 void applyPendingActiveListUpdates();
@@ -208,7 +213,7 @@ void setup() {
   LoRa.receive();
 
   initScenarioActiveRunners();
-  nextHandoverRelayPointer = 2;
+  nextHandoverRelayPointer = TARGET_RELAY_START_ID;
 
   if (isEmergencyRelay()) {
     changeState(EMERGENCY_LISTEN);
@@ -644,7 +649,13 @@ void handleHandoverJoin(String msg) {
   int sourceRelayId = getField(msg, 3).toInt();
   int targetRelayId = getField(msg, 4).toInt();
 
-  if (targetRelayId != RELAY_ID) {
+  bool targetMatchesThisRelay = (targetRelayId == RELAY_ID);
+  if (DEMO_SCENARIO == 2 && RELAY_ID == 2 && DEMO_VIRTUAL_TARGET_GROUP &&
+      isVirtualTargetRelayId(targetRelayId)) {
+    targetMatchesThisRelay = true;
+  }
+
+  if (!targetMatchesThisRelay) {
     return;
   }
 
@@ -655,6 +666,8 @@ void handleHandoverJoin(String msg) {
   Serial.println(runnerId);
   Serial.print("  source_relay_id=");
   Serial.println(sourceRelayId);
+  Serial.print("  target_relay_id=");
+  Serial.println(targetRelayId);
   addPendingAdd(runnerId);
 }
 
@@ -740,22 +753,32 @@ void processHandoverRequests() {
     Serial.println("[HANDOVER] Multiple handover requests detected");
   }
 
-  int approvedIndex = 0;
-  for (int i = 1; i < handoverRequestCount; i++) {
-    if (handoverRequests[i].requestTime < handoverRequests[approvedIndex].requestTime) {
-      approvedIndex = i;
+  for (int i = 0; i < handoverRequestCount - 1; i++) {
+    for (int j = i + 1; j < handoverRequestCount; j++) {
+      if (handoverRequests[j].requestTime < handoverRequests[i].requestTime) {
+        HandoverRequest tmp = handoverRequests[i];
+        handoverRequests[i] = handoverRequests[j];
+        handoverRequests[j] = tmp;
+      }
     }
   }
 
   for (int i = 0; i < handoverRequestCount; i++) {
     int runnerId = handoverRequests[i].runnerId;
-    if (i == approvedIndex) {
+    if (i < TARGET_RELAY_COUNT) {
       int nextRelayId = getNextHandoverRelayId();
-      int nextChannelId = getNextHandoverChannelId();
+      int nextChannelId = getNextHandoverChannelId(nextRelayId);
+      int reserveSlotId = DEMO_VIRTUAL_TARGET_GROUP ? (i + 1) : RELAY_ID;
       approvedRunnerId = runnerId;
       Serial.print("[HANDOVER] Approved runner ");
-      Serial.println(runnerId);
-      prepareAckForRunner(runnerId, nextRelayId, nextChannelId);
+      Serial.print(runnerId);
+      Serial.print(" -> virtual target relay ");
+      Serial.print(nextRelayId);
+      Serial.print(", channel ");
+      Serial.print(nextChannelId);
+      Serial.print(", reserve_slot ");
+      Serial.println(reserveSlotId);
+      prepareAckForRunner(runnerId, nextRelayId, nextChannelId, reserveSlotId);
       addPendingRemove(runnerId);
     } else {
       Serial.print("[HANDOVER] Retry runner ");
@@ -768,22 +791,30 @@ void processHandoverRequests() {
 int getNextHandoverRelayId() {
   int target = nextHandoverRelayPointer;
   nextHandoverRelayPointer++;
-  if (nextHandoverRelayPointer > 2) {
-    nextHandoverRelayPointer = 2;
+  if (nextHandoverRelayPointer >= TARGET_RELAY_START_ID + TARGET_RELAY_COUNT) {
+    nextHandoverRelayPointer = TARGET_RELAY_START_ID;
   }
   return target;
 }
 
-int getNextHandoverChannelId() {
-  return 7;
+int getNextHandoverChannelId(int nextRelayId) {
+  if (DEMO_SCENARIO == 2 && DEMO_VIRTUAL_TARGET_GROUP) {
+    return 7;
+  }
+  return nextRelayId;
 }
 
-void prepareAckForRunner(int runnerId, int nextRelayId, int nextChannelId) {
+bool isVirtualTargetRelayId(int relayId) {
+  return relayId >= TARGET_RELAY_START_ID &&
+         relayId < TARGET_RELAY_START_ID + TARGET_RELAY_COUNT;
+}
+
+void prepareAckForRunner(int runnerId, int nextRelayId, int nextChannelId,
+                         int reserveSlotId) {
   if (responsePacketCount >= MAX_HANDOVER_REQUESTS) {
     return;
   }
 
-  int reserveSlotId = RELAY_ID;
   int validFromCycle = cycleId + 1;
   String msg = "HANDOVER_ACK,";
   msg += String(cycleId);

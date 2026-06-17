@@ -646,7 +646,13 @@ void handleSchedule(String msg) {
     return;
   }
 
-  if (handoverPending && relayId == nextRelayId && cycleId >= validFromCycle) {
+  bool isExpectedTargetSchedule = (relayId == nextRelayId);
+  if (DEMO_SCENARIO == 2 && handoverPending &&
+      channelId == nextChannelId && getField(msg, 3).toInt() >= 2) {
+    isExpectedTargetSchedule = true;
+  }
+
+  if (handoverPending && isExpectedTargetSchedule && cycleId >= validFromCycle) {
     activeCycleId = cycleId;
     currentRelayId = relayId;
     slotDurationMs = parsedSlotMs;
