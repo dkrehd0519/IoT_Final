@@ -4,12 +4,11 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// TTGO LoRa32-OLED 보드 버전에 따라 핀 수정이 필요할 수 있다.
+// 기존 통신 테스트를 통과한 TTGO LoRa32-OLED 환경 설정은 유지한다.
 #define LORA_SS 18
 #define LORA_RST 14
 #define LORA_DIO0 26
 
-// TTGO LoRa32-OLED 보드 버전에 따라 I2C/OLED 설정 수정이 필요할 수 있다.
 #define OLED_SDA 4
 #define OLED_SCL 15
 #define OLED_ADDRESS 0x3C
@@ -17,28 +16,12 @@
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 
-// Relay1은 1, Relay2는 2로 설정한다.
+// 데모 실행 시 Relay 장치마다 아래 값을 변경한다.
+#define DEMO_SCENARIO 1
 #define RELAY_ID 1
-
-// Relay 단독 self-test: Gateway와 Runner를 코드 안에서 흉내 낸다.
-#define RELAY_SELF_TEST_MODE true
-
-#define SELF_TEST_CYCLE_INTERVAL_MS 3000UL
-#define SELF_TEST_RUNNER_SLOT_MS 150
-
-#define SELF_TEST_RUNNER_NORMAL_ENABLE true
-#define SELF_TEST_RUNNER_EMERGENCY_ENABLE true
-
-#define SELF_TEST_NORMAL_RUNNER_ID 1
-#define SELF_TEST_EMERGENCY_RUNNER_ID 2
-
-#define SELF_TEST_NORMAL_DATA_DELAY_MS 300UL
-#define SELF_TEST_EMERGENCY_START_DELAY_MS 700UL
-#define SELF_TEST_EMERGENCY_RETRY_INTERVAL_MS 300UL
-#define SELF_TEST_EMERGENCY_RETRY_COUNT 3
-
-#define SELF_TEST_DUMMY_RSSI -55
-#define SELF_TEST_DUMMY_SNR 8.5
+#define SECTION_ID 1
+#define CHANNEL_ID 1
+#define TEST_MODE true
 
 #define LORA_FREQUENCY 915E6
 #define LORA_SYNC_WORD 0x33
@@ -48,6 +31,7 @@
 #define LORA_CODING_RATE_DENOMINATOR 5
 #define LORA_PREAMBLE_LENGTH 8
 
+// 기존에 검증한 실제 주파수 테이블은 유지하고, 데모 channel id만 논리적으로 매핑한다.
 const long CHANNEL_FREQ_HZ[] = {
   915000000,
   916000000,
@@ -56,180 +40,160 @@ const long CHANNEL_FREQ_HZ[] = {
   919000000,
 };
 
-#define RELAY_BEACON_SLOT_MS 500UL
-#define PHASE_GUARD_MS 500UL
-#define SEND_NOW_TIMEOUT_MS 10000UL
 #define TOTAL_RUNNERS 3
-#define GROUP_COVERAGE_M 10000.0f
-#define RELAY_INTERVAL_M 500.0f
-#define TOTAL_RELAYS 40
-#define CHANNEL_GROUP_COUNT 5
-#define RELAYS_PER_CHANNEL_GROUP \
-  ((TOTAL_RELAYS + CHANNEL_GROUP_COUNT - 1) / CHANNEL_GROUP_COUNT)
-#define RELAY_MAX_COUNT 2
-#define ACTIVE_TIMEOUT_MS 30000UL
-#define MAX_ACTIVE_RUNNERS 300
-#define MAX_BUFFER_SIZE MAX_ACTIVE_RUNNERS
-#define FORWARD_INTERVAL_MS 400UL
-#define EMERGENCY_GATEWAY_FORWARD_MAX 3
-#define BATCH_FORWARD_MODE true
-#define BATCH_MAX_ITEMS 5
+#define MAX_ACTIVE_RUNNERS 6
+#define MAX_BUFFER_SIZE 8
+#define MAX_HANDOVER_REQUESTS 4
+#define MAX_PENDING_UPDATES 4
+#define SLOT_DURATION_MS 900UL
+#define PHASE_GUARD_MS 250UL
+#define CYCLE_GUARD_MS 1400UL
+#define RESPONSE_GAP_MS 250UL
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool oledReady = false;
 
 enum RelayState {
-  WAIT_SCHEDULE,
-  SEND_BEACON,
-  COLLECT_RUNNER_DATA,
+  BUILD_SLOT_TABLE,
+  SEND_SCHEDULE,
+  LISTEN_RESERVE_SLOTS,
+  LISTEN_REGULAR_SLOTS,
+  PROCESS_HANDOVER,
+  SEND_HANDOVER_RESPONSE,
+  UPDATE_ACTIVE_RUNNER_LIST,
   FORWARD_TO_GATEWAY,
-  WAIT_SEND_NOW,
-  CYCLE_DONE
+  CYCLE_DONE,
+  EMERGENCY_LISTEN
 };
 
 struct RunnerData {
   int cycleId;
-  int relayId;
   int runnerId;
   String lat;
   String lng;
   int pace;
   int battery;
-  char status;
-  int seq;
+  unsigned long seq;
+  int gpsValid;
   int rssi;
   float snr;
 };
 
-struct ActiveRunner {
-  bool active;
+struct HandoverRequest {
+  bool valid;
   int runnerId;
-  unsigned long lastSeen;
+  unsigned long requestTime;
 };
 
-RelayState currentState = WAIT_SCHEDULE;
+struct ResponsePacket {
+  bool valid;
+  String message;
+};
+
+RelayState currentState = BUILD_SLOT_TABLE;
+
+int activeRunners[MAX_ACTIVE_RUNNERS];
+int activeRunnerCount = 0;
+int pendingAdd[MAX_PENDING_UPDATES];
+int pendingAddCount = 0;
+int pendingRemove[MAX_PENDING_UPDATES];
+int pendingRemoveCount = 0;
+
 RunnerData relayBuffer[MAX_BUFFER_SIZE];
-ActiveRunner activeRunners[MAX_ACTIVE_RUNNERS];
-
 int bufferCount = 0;
-int activeCycleId = -1;
-int relayCount = 0;
-int runnerCount = 0;
-int runnerSlotMs = 0;
 
-unsigned long scheduleReceivedTime = 0;
-unsigned long beaconSendTime = 0;
-unsigned long runnerPhaseEndTime = 0;
+HandoverRequest handoverRequests[MAX_HANDOVER_REQUESTS];
+int handoverRequestCount = 0;
+ResponsePacket responsePackets[MAX_HANDOVER_REQUESTS];
+int responsePacketCount = 0;
+int responseCursor = 0;
+unsigned long nextResponseTime = 0;
+
+unsigned long cycleId = 1;
 unsigned long stateStartTime = 0;
-unsigned long lastSelfTestCycleTime = 0;
+unsigned long reservePhaseEndTime = 0;
+unsigned long regularPhaseEndTime = 0;
 
-int selfTestCycleId = 1;
-int selfTestNormalSeq = 1;
-int selfTestEmergencySeq = 1001;
-int selfTestEmergencyInjectCount = 0;
-bool selfTestNormalInjected = false;
-bool selfTestSendNowInjected = false;
-
-// Gateway timeout 등의 이유로 SEND_NOW가 Runner phase 중 먼저 온 경우 기억한다.
-bool pendingSendNow = false;
+int currentChannelId = CHANNEL_ID;
+int currentSectionId = SECTION_ID;
+int reserveSlotCount = 0;
+int approvedRunnerId = -1;
+int nextHandoverRelayPointer = 2;
 
 void showOLED(String line1, String line2 = "", String line3 = "", String line4 = "");
 void sendLoRaMessage(String msg);
 bool receiveLoRaMessage(String &msg, int &rssi, float &snr);
 bool startsWithPacket(String msg, String type);
 String getField(String msg, int index);
-void parseSchedule(String msg);
-void sendBeacon();
-int getRelayGroupIndexByRelayId(int relayId);
-int getRelaySlotInChannel(int relayId);
-long getRelayChannelFrequencyHz();
-bool isDuplicateRunnerPacket(int cycleId, int runnerId, int seq);
-void addRunnerDataToBuffer(int cycleId, int relayId, int runnerId,
-                           String lat, String lng, int pace, int battery,
-                           char status, int seq, int rssi, float snr);
-void initActiveRunners();
-void upsertActiveRunner(int runnerId); // Runner를 active list에 추가하거나 lastSeen 갱신
+long getFrequencyByChannel(int channelId);
+int getEffectiveChannelId();
+int getEffectiveSectionId();
+bool isEmergencyRelay();
+void initScenarioActiveRunners();
+void clearCycleData();
+void printActiveRunnerList(String label);
+void printSlotTable();
+bool containsActiveRunner(int runnerId);
+void addActiveRunner(int runnerId);
 void removeActiveRunner(int runnerId);
-void cleanupActiveRunners(); // timeout된 Runner를 active list에서 제거
-int getCurrentCount();
-void handleRunnerData(String msg, int rssi, float snr);
-void handleHandoverPacket(String msg); // HANDOVER 패킷 처리 및 기존 relay에서 runner 제거
-bool isEmergencyDataPacket(String msg);
-void handleReceivedPacket(String msg, int rssi, float snr); // 수신 패킷 종류에 따라 처리 함수로 분기
+void addPendingAdd(int runnerId);
+void addPendingRemove(int runnerId);
+String buildSchedulePacket();
+void handleRunnerStatus(String msg, int rssi, float snr);
+void handleHandoverJoin(String msg);
+void handleEmergency(String msg, int rssi, float snr);
+void addRunnerDataToBuffer(int cycle, int runnerId, String lat, String lng,
+                           int pace, int battery, unsigned long seq,
+                           int gpsValid, int rssi, float snr);
+void addHandoverRequest(int runnerId, unsigned long requestTime);
+void processHandoverRequests();
+int getNextHandoverRelayId();
+int getNextHandoverChannelId();
+void prepareAckForRunner(int runnerId, int nextRelayId, int nextChannelId);
+void prepareRetryForRunner(int runnerId);
+void sendNextHandoverResponseIfNeeded();
+void applyPendingActiveListUpdates();
 void forwardBufferedPacketsToGateway();
-void forwardBufferedPacketsOneByOneToGateway();
-void forwardBufferedPacketsBatchToGateway();
-void sendDonePacket();
-void handleSendNowPacket(String msg);
-void startSelfTestCycle();
-void injectSelfTestRunnerPacketsIfNeeded();
-String makeSelfTestRunnerDataPacket(int cycleId, int runnerId,
-                                    int targetRelayId, char status,
-                                    int seq);
-void injectSelfTestSendNowIfNeeded();
-void clearRelayBuffer();
 void changeState(RelayState nextState);
 const char *stateName(RelayState state);
-void updateOLED();
-int lastEmergencySeq[TOTAL_RUNNERS + 1];
-int emergencyForwardCount[TOTAL_RUNNERS + 1];
-void sendEmergencyPacketToGateway(int cycleId, int runnerId,
-                                  String lat, String lng,
-                                  int pace, int battery,
-                                  char status, int seq,
-                                  int rssi, float snr);
 
-void selfTestGatewayReceive(String msg);
-void selfTestGatewayHandleDone(String msg);
-
-void setup(){
+void setup() {
   Serial.begin(115200);
   delay(1000);
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" TTGO LoRa32 Marathon Relay Node");
+  Serial.println(" TTGO LoRa32 Marathon Relay Demo");
   Serial.println("========================================");
-  Serial.print("[CONFIG] RELAY_ID: ");
+  Serial.print("[CONFIG] DEMO_SCENARIO=");
+  Serial.println(DEMO_SCENARIO);
+  Serial.print("[CONFIG] RELAY_ID=");
   Serial.println(RELAY_ID);
-  Serial.print("[CONFIG] RELAY_SELF_TEST_MODE: ");
-  Serial.println(RELAY_SELF_TEST_MODE ? "true" : "false");
-
-  if(RELAY_ID <= 0){
-    Serial.println("[ERROR] RELAY_ID must be greater than 0.");
-    while(true){
-      delay(1000);
-    }
-  }
+  Serial.println("[CONFIG] LoRa/OLED pin and LoRa settings kept from tested code");
 
   Wire.begin(OLED_SDA, OLED_SCL);
   oledReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
-
-  if(oledReady){
+  if (oledReady) {
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
-    showOLED("Relay Boot", "Relay ID: " + String(RELAY_ID),
-             "OLED ready", "LoRa init...");
-    Serial.println("[OLED] Initialization complete");
-  }else{
-    Serial.println("[OLED][WARN] Initialization failed. Relay continues without OLED.");
   }
 
+  currentChannelId = getEffectiveChannelId();
+  currentSectionId = getEffectiveSectionId();
+  reserveSlotCount = (currentSectionId >= 2) ? 6 : 0;
+
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  long relayFrequency = getRelayChannelFrequencyHz();
+  long freq = getFrequencyByChannel(currentChannelId);
+  Serial.print("[CHANNEL] logical=");
+  Serial.print(currentChannelId);
+  Serial.print(", freq=");
+  Serial.println(freq);
 
-  Serial.print("[CHANNEL] Relay group=");
-  Serial.print(getRelayGroupIndexByRelayId(RELAY_ID) + 1);
-  Serial.print(", frequency=");
-  Serial.println(relayFrequency);
-
-  if(!LoRa.begin(relayFrequency)){
+  if (!LoRa.begin(freq)) {
     Serial.println("[ERROR] LoRa initialization failed. Check wiring and board pins.");
-    showOLED("LoRa ERROR", "Relay: " + String(RELAY_ID),
-             "Check pins", "Relay stopped");
-
-    while(true){
+    showOLED("LoRa ERROR", "Relay " + String(RELAY_ID), "Check pins");
+    while (true) {
       delay(1000);
     }
   }
@@ -243,107 +207,122 @@ void setup(){
   LoRa.enableCrc();
   LoRa.receive();
 
-  Serial.println("[LoRa] Initialization complete");
-  Serial.println("[LoRa] 915 MHz, SF7, BW125 kHz, CR4/5, SyncWord 0x33, CRC ON");
+  initScenarioActiveRunners();
+  nextHandoverRelayPointer = 2;
 
-  clearRelayBuffer();
-  initActiveRunners();
-  for(int i = 0; i <= TOTAL_RUNNERS; i++){
-    lastEmergencySeq[i] = -1;
-    emergencyForwardCount[i] = 0;
+  if (isEmergencyRelay()) {
+    changeState(EMERGENCY_LISTEN);
+  } else {
+    changeState(BUILD_SLOT_TABLE);
   }
-  lastSelfTestCycleTime = millis() - SELF_TEST_CYCLE_INTERVAL_MS;
-  currentState = WAIT_SCHEDULE;
-  stateStartTime = millis();
-  updateOLED();
 }
 
-void loop(){
-  cleanupActiveRunners();
+void loop() {
+  String message;
+  int rssi = 0;
+  float snr = 0.0;
 
-  if(RELAY_SELF_TEST_MODE){
-    startSelfTestCycle();
-  }
-
-  // 현재 상태에 필요한 packet만 처리한다.
-  if(currentState == WAIT_SCHEDULE ||
-      currentState == COLLECT_RUNNER_DATA ||
-      currentState == WAIT_SEND_NOW){
-
-    String message;
-    int rssi = 0;
-    float snr = 0.0;
-
-    if(receiveLoRaMessage(message, rssi, snr)){
-      handleReceivedPacket(message, rssi, snr);
+  if (currentState == LISTEN_RESERVE_SLOTS ||
+      currentState == LISTEN_REGULAR_SLOTS ||
+      currentState == EMERGENCY_LISTEN) {
+    if (receiveLoRaMessage(message, rssi, snr)) {
+      if (startsWithPacket(message, "HANDOVER_JOIN")) {
+        handleHandoverJoin(message);
+      } else if (startsWithPacket(message, "RUNNER_STATUS")) {
+        handleRunnerStatus(message, rssi, snr);
+      } else if (startsWithPacket(message, "EMERGENCY")) {
+        handleEmergency(message, rssi, snr);
+      } else {
+        Serial.println("[RX] Ignored packet for Relay");
+      }
     }
   }
 
-  if(RELAY_SELF_TEST_MODE){
-    injectSelfTestRunnerPacketsIfNeeded();
-    injectSelfTestSendNowIfNeeded();
-  }
-
-  switch(currentState){
-    case WAIT_SCHEDULE:
+  switch (currentState) {
+    case BUILD_SLOT_TABLE:
+      clearCycleData();
+      Serial.println();
+      Serial.print("[CYCLE] Relay ");
+      Serial.print(RELAY_ID);
+      Serial.print(" starting cycle ");
+      Serial.println(cycleId);
+      printActiveRunnerList("Active Runner List");
+      printSlotTable();
+      changeState(SEND_SCHEDULE);
       break;
 
-    case SEND_BEACON:
-      if((long)(millis()- beaconSendTime)>= 0){
-        sendBeacon();
-        changeState(COLLECT_RUNNER_DATA);
+    case SEND_SCHEDULE:
+      sendLoRaMessage(buildSchedulePacket());
+      stateStartTime = millis();
+      reservePhaseEndTime = stateStartTime + PHASE_GUARD_MS +
+                            (unsigned long)reserveSlotCount * SLOT_DURATION_MS;
+      regularPhaseEndTime = reservePhaseEndTime +
+                            (unsigned long)activeRunnerCount * SLOT_DURATION_MS;
+      if (reserveSlotCount > 0) {
+        changeState(LISTEN_RESERVE_SLOTS);
+      } else {
+        changeState(LISTEN_REGULAR_SLOTS);
       }
       break;
 
-    case COLLECT_RUNNER_DATA:
-      if((long)(millis()- runnerPhaseEndTime)>= 0){
-        Serial.println("[RUNNER] Runner collection phase complete");
-
-        if(RELAY_ID == 1){
-          changeState(FORWARD_TO_GATEWAY);
-        }else if(pendingSendNow){
-          Serial.println("[CONTROL] Previously received SEND_NOW is valid");
-          changeState(FORWARD_TO_GATEWAY);
-        }else {
-          changeState(WAIT_SEND_NOW);
-        }
+    case LISTEN_RESERVE_SLOTS:
+      if ((long)(millis() - reservePhaseEndTime) >= 0) {
+        Serial.println("[PHASE] Reserve slot phase complete");
+        changeState(LISTEN_REGULAR_SLOTS);
       }
+      break;
+
+    case LISTEN_REGULAR_SLOTS:
+      if ((long)(millis() - regularPhaseEndTime) >= 0) {
+        Serial.println("[PHASE] Regular runner uplink phase complete");
+        changeState(PROCESS_HANDOVER);
+      }
+      break;
+
+    case PROCESS_HANDOVER:
+      processHandoverRequests();
+      if (responsePacketCount > 0) {
+        responseCursor = 0;
+        nextResponseTime = millis();
+        changeState(SEND_HANDOVER_RESPONSE);
+      } else {
+        changeState(UPDATE_ACTIVE_RUNNER_LIST);
+      }
+      break;
+
+    case SEND_HANDOVER_RESPONSE:
+      sendNextHandoverResponseIfNeeded();
+      if (responseCursor >= responsePacketCount) {
+        changeState(UPDATE_ACTIVE_RUNNER_LIST);
+      }
+      break;
+
+    case UPDATE_ACTIVE_RUNNER_LIST:
+      applyPendingActiveListUpdates();
+      changeState(FORWARD_TO_GATEWAY);
       break;
 
     case FORWARD_TO_GATEWAY:
       forwardBufferedPacketsToGateway();
-      sendDonePacket();
       changeState(CYCLE_DONE);
       break;
 
-    case WAIT_SEND_NOW:
-      if((unsigned long)(millis()- stateStartTime)>= SEND_NOW_TIMEOUT_MS){
-        Serial.print("[TIMEOUT] SEND_NOW not received within ");
-        Serial.print(SEND_NOW_TIMEOUT_MS);
-        Serial.println(" ms. Abandoning this cycle.");
-        changeState(CYCLE_DONE);
+    case CYCLE_DONE:
+      if ((unsigned long)(millis() - stateStartTime) >= CYCLE_GUARD_MS) {
+        cycleId++;
+        changeState(BUILD_SLOT_TABLE);
       }
       break;
 
-    case CYCLE_DONE:
-      Serial.print("[CYCLE] Cycle ");
-      Serial.print(activeCycleId);
-      Serial.println(" complete. Waiting for next SCHEDULE.");
-      activeCycleId = -1;
-      relayCount = 0;
-      runnerCount = 0;
-      runnerSlotMs = 0;
-      pendingSendNow = false;
-      changeState(WAIT_SCHEDULE);
+    case EMERGENCY_LISTEN:
       break;
   }
 }
 
-void showOLED(String line1, String line2, String line3, String line4){
-  if(!oledReady){
+void showOLED(String line1, String line2, String line3, String line4) {
+  if (!oledReady) {
     return;
   }
-
   display.clearDisplay();
   display.setCursor(0, 0);
   display.println(line1);
@@ -353,38 +332,30 @@ void showOLED(String line1, String line2, String line3, String line4){
   display.display();
 }
 
-void sendLoRaMessage(String msg){
+void sendLoRaMessage(String msg) {
   LoRa.idle();
   LoRa.beginPacket();
   LoRa.print(msg);
-
-  if(LoRa.endPacket()== 1){
+  if (LoRa.endPacket() == 1) {
     Serial.print("[TX] ");
     Serial.println(msg);
-
-    if(RELAY_SELF_TEST_MODE){
-      selfTestGatewayReceive(msg);
-    }
-
-  }else {
+  } else {
     Serial.println("[TX][ERROR] LoRa transmission failed");
   }
-
   LoRa.receive();
 }
 
-bool receiveLoRaMessage(String &msg, int &rssi, float &snr){
+bool receiveLoRaMessage(String &msg, int &rssi, float &snr) {
   int packetSize = LoRa.parsePacket();
-  if(packetSize == 0){
+  if (packetSize == 0) {
     return false;
   }
 
   msg = "";
-  while(LoRa.available()){
-    msg +=(char)LoRa.read();
+  while (LoRa.available()) {
+    msg += (char)LoRa.read();
   }
   msg.trim();
-
   rssi = LoRa.packetRssi();
   snr = LoRa.packetSnr();
 
@@ -395,308 +366,237 @@ bool receiveLoRaMessage(String &msg, int &rssi, float &snr){
   Serial.print(" dBm, SNR=");
   Serial.print(snr, 2);
   Serial.println(" dB");
-
   return true;
 }
 
-bool startsWithPacket(String msg, String type){
+bool startsWithPacket(String msg, String type) {
   msg.trim();
   type.trim();
   return msg == type || msg.startsWith(type + ",");
 }
 
-String getField(String msg, int index){
-  if(index < 0){
+String getField(String msg, int index) {
+  if (index < 0) {
     return "";
   }
 
   int fieldStart = 0;
   int currentIndex = 0;
-
-  for(int i = 0; i <= msg.length(); i++){
-    if(i == msg.length()|| msg.charAt(i)== ','){
-      if(currentIndex == index){
+  for (int i = 0; i <= msg.length(); i++) {
+    if (i == msg.length() || msg.charAt(i) == ',') {
+      if (currentIndex == index) {
         String field = msg.substring(fieldStart, i);
         field.trim();
         return field;
       }
-
       currentIndex++;
       fieldStart = i + 1;
     }
   }
-
   return "";
 }
 
-void parseSchedule(String msg){
-  // SCHEDULE,cycle_id,relay_count,runner_count,runner_slot_ms
-  String cycleField = getField(msg, 1);
-  String relayCountField = getField(msg, 2);
-  String runnerCountField = getField(msg, 3);
-  String runnerSlotField = getField(msg, 4);
+long getFrequencyByChannel(int channelId) {
+  int index = 0;
+  if (channelId == 1) {
+    index = 0;
+  } else if (channelId == 2) {
+    index = 1;
+  } else if (channelId == 7) {
+    index = 2;
+  } else if (channelId == 13) {
+    index = 3;
+  } else {
+    index = (channelId - 1) % 5;
+    if (index < 0) {
+      index = 0;
+    }
+  }
+  return CHANNEL_FREQ_HZ[index];
+}
 
-  if(getField(msg, 0)!= "SCHEDULE" ||
-      cycleField.length()== 0 ||
-      relayCountField.length()== 0 ||
-      runnerCountField.length()== 0 ||
-      runnerSlotField.length()== 0 ||
-      getField(msg, 5).length()!= 0){
-    Serial.println("[SCHEDULE][ERROR] Invalid CSV format");
+int getEffectiveChannelId() {
+  if (DEMO_SCENARIO == 1) {
+    return (RELAY_ID == 2) ? 2 : 1;
+  }
+  if (DEMO_SCENARIO == 2) {
+    return (RELAY_ID == 2) ? 7 : 1;
+  }
+  if (DEMO_SCENARIO == 3) {
+    return (RELAY_ID == 2) ? 13 : 1;
+  }
+  return CHANNEL_ID;
+}
+
+int getEffectiveSectionId() {
+  if (DEMO_SCENARIO == 2 && RELAY_ID == 2) {
+    return 2;
+  }
+  return SECTION_ID;
+}
+
+bool isEmergencyRelay() {
+  return DEMO_SCENARIO == 3 && RELAY_ID == 2;
+}
+
+void initScenarioActiveRunners() {
+  activeRunnerCount = 0;
+  for (int i = 0; i < MAX_ACTIVE_RUNNERS; i++) {
+    activeRunners[i] = -1;
+  }
+
+  if (DEMO_SCENARIO == 1) {
+    if (RELAY_ID == 1) {
+      activeRunners[activeRunnerCount++] = 1;
+      activeRunners[activeRunnerCount++] = 2;
+    } else if (RELAY_ID == 2) {
+      activeRunners[activeRunnerCount++] = 3;
+    }
+  } else if (DEMO_SCENARIO == 2) {
+    if (RELAY_ID == 1) {
+      activeRunners[activeRunnerCount++] = 1;
+      activeRunners[activeRunnerCount++] = 2;
+      activeRunners[activeRunnerCount++] = 3;
+    }
+  } else if (DEMO_SCENARIO == 3) {
+    if (RELAY_ID == 1) {
+      activeRunners[activeRunnerCount++] = 1;
+      activeRunners[activeRunnerCount++] = 2;
+      activeRunners[activeRunnerCount++] = 3;
+    }
+  }
+}
+
+void clearCycleData() {
+  bufferCount = 0;
+  pendingAddCount = 0;
+  pendingRemoveCount = 0;
+  handoverRequestCount = 0;
+  responsePacketCount = 0;
+  responseCursor = 0;
+  approvedRunnerId = -1;
+  for (int i = 0; i < MAX_HANDOVER_REQUESTS; i++) {
+    handoverRequests[i].valid = false;
+    responsePackets[i].valid = false;
+    responsePackets[i].message = "";
+  }
+}
+
+void printActiveRunnerList(String label) {
+  Serial.print("[ACTIVE] ");
+  Serial.print(label);
+  Serial.print(": ");
+  if (activeRunnerCount == 0) {
+    Serial.println("empty");
     return;
   }
+  for (int i = 0; i < activeRunnerCount; i++) {
+    Serial.print("Runner ");
+    Serial.print(activeRunners[i]);
+    if (i < activeRunnerCount - 1) {
+      Serial.print(", ");
+    }
+  }
+  Serial.println();
+}
 
-  int parsedCycleId = cycleField.toInt();
-  int parsedRelayCount = relayCountField.toInt();
-  int parsedRunnerCount = runnerCountField.toInt();
-  int parsedRunnerSlotMs = runnerSlotField.toInt();
-
-  if(parsedCycleId < 0 ||
-      parsedRelayCount <= 0 ||
-      parsedRunnerCount <= 0 ||
-      parsedRunnerSlotMs <= 0){
-    Serial.println("[SCHEDULE][ERROR] Invalid field value");
-    return;
+void printSlotTable() {
+  Serial.println("[SLOT_TABLE] Regular slots");
+  if (activeRunnerCount == 0) {
+    Serial.println("  no active runners");
+  }
+  for (int i = 0; i < activeRunnerCount; i++) {
+    Serial.print("  Regular Slot ");
+    Serial.print(i + 1);
+    Serial.print(" -> Runner ");
+    Serial.println(activeRunners[i]);
   }
 
-  clearRelayBuffer();
-  activeCycleId = parsedCycleId;
-  relayCount = parsedRelayCount;
-  runnerCount = parsedRunnerCount;
-  runnerSlotMs = parsedRunnerSlotMs;
-  pendingSendNow = false;
-  scheduleReceivedTime = millis();
-
-  // 같은 channel index 안에서는 relayId 간격별 slot을 사용한다.
-  unsigned long relaySlotIndex =
-     (unsigned long)getRelaySlotInChannel(RELAY_ID);
-  beaconSendTime =
-      scheduleReceivedTime + relaySlotIndex * RELAY_BEACON_SLOT_MS;
-
-  // 모든 Relay beacon slot과 guard 이후 Runner uplink phase가 시작된다.
-  unsigned long beaconPhaseMs =
-     (unsigned long)RELAYS_PER_CHANNEL_GROUP * RELAY_BEACON_SLOT_MS;
-  unsigned long runnerPhaseMs =
-     (unsigned long)RELAY_MAX_COUNT *(unsigned long)runnerSlotMs;
-  runnerPhaseEndTime =
-      scheduleReceivedTime + beaconPhaseMs + PHASE_GUARD_MS + runnerPhaseMs;
-
-  Serial.print("[SCHEDULE] cycle=");
-  Serial.print(activeCycleId);
-  Serial.print(", relay_count=");
-  Serial.print(relayCount);
-  Serial.print(", runner_count=");
-  Serial.print(runnerCount);
-  Serial.print(", runner_slot_ms=");
-  Serial.println(runnerSlotMs);
-  Serial.print("[TIMING] Beacon send at millis=");
-  Serial.print(beaconSendTime);
-  Serial.print(", Runner phase ends at millis=");
-  Serial.println(runnerPhaseEndTime);
-
-  changeState(SEND_BEACON);
-}
-
-int getRelayGroupIndexByRelayId(int relayId){
-  return (relayId - 1) % CHANNEL_GROUP_COUNT;
-}
-
-int getRelaySlotInChannel(int relayId){
-  return (relayId - 1) / CHANNEL_GROUP_COUNT;
-}
-
-long getRelayChannelFrequencyHz(){
-  int groupIndex = getRelayGroupIndexByRelayId(RELAY_ID);
-  int channelCount = sizeof(CHANNEL_FREQ_HZ) / sizeof(CHANNEL_FREQ_HZ[0]);
-
-  if(groupIndex < 0){
-    groupIndex = 0;
+  if (reserveSlotCount > 0) {
+    Serial.println("[SLOT_TABLE] Handover reserve slots");
+    for (int i = 0; i < reserveSlotCount; i++) {
+      Serial.print("  Reserve Slot ");
+      Serial.print(i + 1);
+      Serial.print(" -> source Relay ");
+      Serial.println(i + 1);
+    }
   }
-
-  if(groupIndex >= channelCount){
-    groupIndex = channelCount - 1;
-  }
-
-  return CHANNEL_FREQ_HZ[groupIndex];
 }
 
-void sendBeacon(){
-  // BEACON,cycle_id,relay_id,currentCount,maxCount,runnerSlotMs
-  int currentCount = getCurrentCount();
-  String message = "BEACON,";
-  message += String(activeCycleId);
-  message += ",";
-  message += String(RELAY_ID);
-  message += ",";
-  message += String(currentCount);
-  message += ",";
-  message += String(RELAY_MAX_COUNT);
-  message += ",";
-  message += String(runnerSlotMs);
-
-  Serial.print("[BEACON] relay=");
-  Serial.print(RELAY_ID);
-  Serial.print(", count=");
-  Serial.print(currentCount);
-  Serial.print("/");
-  Serial.print(RELAY_MAX_COUNT);
-  Serial.print(", slot=");
-  Serial.println(getRelaySlotInChannel(RELAY_ID));
-  sendLoRaMessage(message);
-}
-
-bool isDuplicateRunnerPacket(int cycleId, int runnerId, int seq){
-  for(int i = 0; i < bufferCount; i++){
-    if(relayBuffer[i].cycleId == cycleId &&
-        relayBuffer[i].runnerId == runnerId &&
-        relayBuffer[i].seq == seq){
+bool containsActiveRunner(int runnerId) {
+  for (int i = 0; i < activeRunnerCount; i++) {
+    if (activeRunners[i] == runnerId) {
       return true;
     }
   }
-
   return false;
 }
 
-void addRunnerDataToBuffer(int cycleId, int relayId, int runnerId,
-                           String lat, String lng, int pace, int battery,
-                           char status,int seq, int rssi, float snr){
-  if(bufferCount >= MAX_BUFFER_SIZE){
-    Serial.println("[BUFFER][WARN] Buffer full. Runner packet dropped.");
+void addActiveRunner(int runnerId) {
+  if (containsActiveRunner(runnerId)) {
     return;
   }
-
-  if(isDuplicateRunnerPacket(cycleId, runnerId, seq)){
-    Serial.print("[BUFFER] Duplicate dropped: runner=");
-    Serial.print(runnerId);
-    Serial.print(", seq=");
-    Serial.println(seq);
+  if (activeRunnerCount >= MAX_ACTIVE_RUNNERS) {
+    Serial.println("[ACTIVE][WARN] activeRunnerList full");
     return;
   }
-
-  RunnerData &data = relayBuffer[bufferCount];
-  data.cycleId = cycleId;
-  data.relayId = relayId;
-  data.runnerId = runnerId;
-  data.lat = lat;
-  data.lng = lng;
-  data.pace = pace;
-  data.battery = battery;
-  data.status = status;
-  data.seq = seq;
-  data.rssi = rssi;
-  data.snr = snr;
-  bufferCount++;
-
-  Serial.print("[BUFFER] Added runner ");
-  Serial.print(runnerId);
-  Serial.print(", seq=");
-  Serial.print(seq);
-  Serial.print(", count=");
-  Serial.print(bufferCount);
-  Serial.print("/");
-  Serial.println(MAX_BUFFER_SIZE);
-  updateOLED();
-}
-
-void initActiveRunners(){
-  for(int i = 0; i < MAX_ACTIVE_RUNNERS; i++){
-    activeRunners[i].active = false;
-    activeRunners[i].runnerId = -1;
-    activeRunners[i].lastSeen = 0;
-  }
-}
-
-// If the same runner come in update the lastSeen time. Otherwise, insert to the active runner list.
-void upsertActiveRunner(int runnerId){
-  int emptyIndex = -1;
-
-  for(int i = 0; i < MAX_ACTIVE_RUNNERS; i++){
-    if(activeRunners[i].active && activeRunners[i].runnerId == runnerId){
-      activeRunners[i].lastSeen = millis();
-      return;
-    }
-
-    if(!activeRunners[i].active && emptyIndex < 0){
-      emptyIndex = i;
-    }
-  }
-
-  if(emptyIndex < 0){
-    Serial.println("[ACTIVE][WARN] Active runner list is full");
-    return;
-  }
-
-  activeRunners[emptyIndex].active = true;
-  activeRunners[emptyIndex].runnerId = runnerId;
-  activeRunners[emptyIndex].lastSeen = millis();
-
-  Serial.print("[ACTIVE_ADD] runner ");
+  activeRunners[activeRunnerCount++] = runnerId;
+  Serial.print("[ACTIVE_ADD] Target relay activeRunnerList updated: Runner ");
   Serial.println(runnerId);
 }
 
-// when a relay receives a HandOver packet, it should remove the runner from its active list.
-void removeActiveRunner(int runnerId){
-  for(int i = 0; i < MAX_ACTIVE_RUNNERS; i++){
-    if(activeRunners[i].active &&
-        activeRunners[i].runnerId == runnerId){
-      activeRunners[i].active = false;
-      activeRunners[i].runnerId = -1;
-      activeRunners[i].lastSeen = 0;
-
-      Serial.print("[ACTIVE_REMOVE] runner ");
+void removeActiveRunner(int runnerId) {
+  for (int i = 0; i < activeRunnerCount; i++) {
+    if (activeRunners[i] == runnerId) {
+      for (int j = i; j < activeRunnerCount - 1; j++) {
+        activeRunners[j] = activeRunners[j + 1];
+      }
+      activeRunnerCount--;
+      activeRunners[activeRunnerCount] = -1;
+      Serial.print("[ACTIVE_REMOVE] Source relay activeRunnerList updated: Runner ");
       Serial.println(runnerId);
       return;
     }
   }
 }
 
-// If a runner is not heard from for a certain time, it is removed from the active list considering it has finished
-void cleanupActiveRunners(){
-  unsigned long now = millis();
-  for(int i = 0; i < MAX_ACTIVE_RUNNERS; i++){
-    if(activeRunners[i].active &&
-       (unsigned long)(now - activeRunners[i].lastSeen)>=
-            ACTIVE_TIMEOUT_MS){
-      int runnerId = activeRunners[i].runnerId;
-      activeRunners[i].active = false;
-      activeRunners[i].runnerId = -1;
-      activeRunners[i].lastSeen = 0;
-      Serial.print("[ACTIVE_TIMEOUT_REMOVE] runner ");
-      Serial.println(runnerId);
-    }
-  }
-}
-
-int getCurrentCount(){
-  int count = 0;
-
-  for(int i = 0; i < MAX_ACTIVE_RUNNERS; i++){
-    if(activeRunners[i].active){
-      count++;
-    }
-  }
-
-  return count;
-}
-
-void handleRunnerData(String msg, int rssi, float snr){
-  // DATA,cycle_id,runner_id,selectedRelayId,lat,lng,pace,battery,seq,gps_valid,status
-  if(getField(msg, 0)!= "DATA" ||
-      getField(msg, 1).length()== 0 ||
-      getField(msg, 2).length()== 0 ||
-      getField(msg, 3).length()== 0 ||
-      getField(msg, 4).length()== 0 ||
-      getField(msg, 5).length()== 0 ||
-      getField(msg, 6).length()== 0 ||
-      getField(msg, 7).length()== 0 ||
-      getField(msg, 8).length()== 0 ||
-      getField(msg, 9).length()== 0 ||
-      getField(msg, 10).length()== 0 ||
-      getField(msg, 11).length()!= 0){
-    Serial.println("[DATA][ERROR] Invalid CSV format");
+void addPendingAdd(int runnerId) {
+  if (pendingAddCount >= MAX_PENDING_UPDATES) {
     return;
   }
+  pendingAdd[pendingAddCount++] = runnerId;
+}
 
+void addPendingRemove(int runnerId) {
+  if (pendingRemoveCount >= MAX_PENDING_UPDATES) {
+    return;
+  }
+  pendingRemove[pendingRemoveCount++] = runnerId;
+}
+
+String buildSchedulePacket() {
+  String msg = "SCHEDULE,";
+  msg += String(cycleId);
+  msg += ",";
+  msg += String(RELAY_ID);
+  msg += ",";
+  msg += String(currentSectionId);
+  msg += ",";
+  msg += String(currentChannelId);
+  msg += ",";
+  msg += String(SLOT_DURATION_MS);
+  msg += ",";
+  msg += String(reserveSlotCount);
+  msg += ",";
+  msg += String(activeRunnerCount);
+  for (int i = 0; i < activeRunnerCount; i++) {
+    msg += ",";
+    msg += String(activeRunners[i]);
+  }
+  return msg;
+}
+
+void handleRunnerStatus(String msg, int rssi, float snr) {
   int packetCycleId = getField(msg, 1).toInt();
   int runnerId = getField(msg, 2).toInt();
   int targetRelayId = getField(msg, 3).toInt();
@@ -704,707 +604,340 @@ void handleRunnerData(String msg, int rssi, float snr){
   String lng = getField(msg, 5);
   int pace = getField(msg, 6).toInt();
   int battery = getField(msg, 7).toInt();
-  int seq = getField(msg, 8).toInt();
-  String gpsValidField = getField(msg, 9);
-  String statusField = getField(msg, 10);
-  char status = statusField.charAt(0);
+  unsigned long runnerSeq = (unsigned long)getField(msg, 8).toInt();
+  int gpsValid = getField(msg, 9).toInt();
+  int handoverRequest = getField(msg, 10).toInt();
+  unsigned long requestTime = (unsigned long)getField(msg, 11).toInt();
 
-  if(runnerId <= 0 || runnerId > TOTAL_RUNNERS || seq < 0){
-    Serial.println("[DATA][ERROR] Invalid runner_id or seq");
+  if (packetCycleId != (int)cycleId) {
+    Serial.println("[RUNNER_STATUS] Dropped: cycle mismatch");
+    return;
+  }
+  if (targetRelayId != RELAY_ID) {
+    Serial.println("[RUNNER_STATUS] Dropped: target relay mismatch");
+    return;
+  }
+  if (!containsActiveRunner(runnerId)) {
+    Serial.println("[RUNNER_STATUS] Dropped: runner is not in activeRunnerList");
     return;
   }
 
-  if(statusField.length()!= 1 ||
-     (status != 'M' && status != 'E')){
-    Serial.println("[DATA][ERROR] Invalid status");
-    return;
+  Serial.println("[RUNNER_STATUS] Received Runner Packet");
+  Serial.print("  runner_id=");
+  Serial.println(runnerId);
+  Serial.print("  handover_request=");
+  Serial.println(handoverRequest);
+
+  addRunnerDataToBuffer(packetCycleId, runnerId, lat, lng, pace, battery,
+                        runnerSeq, gpsValid, rssi, snr);
+
+  if (handoverRequest == 1) {
+    Serial.print("[HANDOVER] Handover request received from Runner ");
+    Serial.println(runnerId);
+    addHandoverRequest(runnerId, requestTime);
   }
-
-  bool isEmergency = (status == 'E');
-  if(!isEmergency && packetCycleId != activeCycleId){
-    Serial.print("[DATA] Dropped: cycle ");
-    Serial.print(packetCycleId);
-    Serial.print(" does not match active cycle ");
-    Serial.println(activeCycleId);
-    return;
-  }
-
-  if(isEmergency && packetCycleId != activeCycleId){
-    Serial.print("[EMERGENCY] Accepted despite cycle mismatch. packetCycle=");
-    Serial.print(packetCycleId);
-    Serial.print(", activeCycle=");
-    Serial.println(activeCycleId);
-  }
-
-  if(targetRelayId != RELAY_ID &&
-     !(isEmergency && targetRelayId == 0)){
-    Serial.print("[DATA] Dropped: selected relay ");
-    Serial.print(targetRelayId);
-    Serial.print(" is not this relay ");
-    Serial.println(RELAY_ID);
-    return;
-  }
-
-  if(gpsValidField.length()> 0){
-    Serial.print("[DATA] gps_valid=");
-    Serial.println(gpsValidField);
-  }
-
-  if(isEmergency){
-    // LoRa 송신 중에는 수신할 수 없으므로 Runner가 같은 event를 3회 재전송한다.
-    upsertActiveRunner(runnerId);
-
-    if(lastEmergencySeq[runnerId] != seq){
-      lastEmergencySeq[runnerId] = seq;
-      emergencyForwardCount[runnerId] = 0;
-
-      Serial.print("[EMERGENCY][NEW] runner ");
-      Serial.print(runnerId);
-      Serial.print(", seq=");
-      Serial.println(seq);
-    }
-
-    if(emergencyForwardCount[runnerId] < EMERGENCY_GATEWAY_FORWARD_MAX){
-      int emergencyCycleId = packetCycleId;
-      if(emergencyCycleId < 0){
-        emergencyCycleId = activeCycleId;
-      }
-
-      Serial.print("[EMERGENCY][FORWARD_RETRY] runner=");
-      Serial.print(runnerId);
-      Serial.print(", seq=");
-      Serial.print(seq);
-      Serial.print(", forward_count=");
-      Serial.print(emergencyForwardCount[runnerId] + 1);
-      Serial.print("/");
-      Serial.println(EMERGENCY_GATEWAY_FORWARD_MAX);
-
-      sendEmergencyPacketToGateway(emergencyCycleId, runnerId, lat, lng,
-                                   pace, battery, status, seq, rssi, snr);
-      emergencyForwardCount[runnerId]++;
-    }else{
-      Serial.print("[EMERGENCY] Forward limit reached. runner=");
-      Serial.print(runnerId);
-      Serial.print(", seq=");
-      Serial.println(seq);
-    }
-
-    return;
-  }
-
-  // 지금 RUNNER를 보낸 Runner가 이미 이 Relay의 active list에 등록되어 있는지 확인한다.
-  bool alreadyActive = false;
-  for(int i = 0; i < MAX_ACTIVE_RUNNERS; i++){
-    if(activeRunners[i].active && activeRunners[i].runnerId == runnerId){
-      alreadyActive = true;
-      break;
-    }
-  }
-
-  // 일반 DATA만 maxCount 제한을 적용한다.
-  if(!alreadyActive && getCurrentCount() >= RELAY_MAX_COUNT){
-    Serial.print("[DATA] Dropped: relay capacity reached ");
-    Serial.print(getCurrentCount());
-    Serial.print("/");
-    Serial.println(RELAY_MAX_COUNT);
-    return;
-  }
-
-  upsertActiveRunner(runnerId);
-  Serial.print("[DATA_ACCEPT] runner=");
-  Serial.print(runnerId);
-  Serial.print(", currentCount=");
-  Serial.print(getCurrentCount());
-  Serial.print("/");
-  Serial.println(RELAY_MAX_COUNT);
-
-  addRunnerDataToBuffer(packetCycleId, RELAY_ID, runnerId, lat, lng,
-                        pace, battery, status, seq, rssi, snr);
 }
 
-void handleHandoverPacket(String msg){
-  // HANDOVER,cycle_id,runner_id,oldRelayId,newRelayId
-  if(getField(msg, 0)!= "HANDOVER" ||
-      getField(msg, 1).length()== 0 ||
-      getField(msg, 2).length()== 0 ||
-      getField(msg, 3).length()== 0 ||
-      getField(msg, 4).length()== 0 ||
-      getField(msg, 5).length()!= 0){
-    Serial.println("[HANDOVER][ERROR] Invalid CSV format");
-    return;
-  }
-
+void handleHandoverJoin(String msg) {
   int packetCycleId = getField(msg, 1).toInt();
   int runnerId = getField(msg, 2).toInt();
-  int oldRelayId = getField(msg, 3).toInt();
-  int newRelayId = getField(msg, 4).toInt();
+  int sourceRelayId = getField(msg, 3).toInt();
+  int targetRelayId = getField(msg, 4).toInt();
 
-  if(packetCycleId != activeCycleId ||
-      runnerId <= 0 || runnerId > TOTAL_RUNNERS ||
-      oldRelayId <= 0 || newRelayId <= 0){
-    Serial.println("[HANDOVER] Ignored invalid cycle or field value");
+  if (targetRelayId != RELAY_ID) {
     return;
   }
 
-  if(oldRelayId == RELAY_ID){
-    removeActiveRunner(runnerId);
+  Serial.println("[HANDOVER_JOIN] received");
+  Serial.print("  cycle_id=");
+  Serial.println(packetCycleId);
+  Serial.print("  runner_id=");
+  Serial.println(runnerId);
+  Serial.print("  source_relay_id=");
+  Serial.println(sourceRelayId);
+  addPendingAdd(runnerId);
+}
+
+void handleEmergency(String msg, int rssi, float snr) {
+  if (!isEmergencyRelay()) {
+    return;
+  }
+
+  int emergencyId = getField(msg, 1).toInt();
+  int runnerId = getField(msg, 2).toInt();
+  String lat = getField(msg, 3);
+  String lng = getField(msg, 4);
+  int battery = getField(msg, 5).toInt();
+  String timestamp = getField(msg, 6);
+  int gpsValid = getField(msg, 7).toInt();
+
+  Serial.println("[EMERGENCY] Emergency packet received. Forwarding to Emergency Gateway.");
+
+  String forward = "EMERGENCY_FORWARD,";
+  forward += String(emergencyId);
+  forward += ",";
+  forward += String(RELAY_ID);
+  forward += ",";
+  forward += String(runnerId);
+  forward += ",";
+  forward += lat;
+  forward += ",";
+  forward += lng;
+  forward += ",";
+  forward += String(battery);
+  forward += ",";
+  forward += timestamp;
+  forward += ",";
+  forward += String(gpsValid);
+  forward += ",";
+  forward += String(rssi);
+  forward += ",";
+  forward += String(snr, 2);
+  sendLoRaMessage(forward);
+}
+
+void addRunnerDataToBuffer(int cycle, int runnerId, String lat, String lng,
+                           int pace, int battery, unsigned long runnerSeq,
+                           int gpsValid, int rssi, float snr) {
+  if (bufferCount >= MAX_BUFFER_SIZE) {
+    Serial.println("[BUFFER][WARN] Buffer full");
+    return;
+  }
+
+  RunnerData &data = relayBuffer[bufferCount++];
+  data.cycleId = cycle;
+  data.runnerId = runnerId;
+  data.lat = lat;
+  data.lng = lng;
+  data.pace = pace;
+  data.battery = battery;
+  data.seq = runnerSeq;
+  data.gpsValid = gpsValid;
+  data.rssi = rssi;
+  data.snr = snr;
+
+  Serial.print("[BUFFER] Stored runner packet. count=");
+  Serial.println(bufferCount);
+}
+
+void addHandoverRequest(int runnerId, unsigned long requestTime) {
+  if (handoverRequestCount >= MAX_HANDOVER_REQUESTS) {
+    return;
+  }
+  handoverRequests[handoverRequestCount].valid = true;
+  handoverRequests[handoverRequestCount].runnerId = runnerId;
+  handoverRequests[handoverRequestCount].requestTime = requestTime;
+  handoverRequestCount++;
+}
+
+void processHandoverRequests() {
+  if (handoverRequestCount == 0) {
+    Serial.println("[HANDOVER] No handover requests");
+    return;
+  }
+
+  if (handoverRequestCount > 1) {
+    Serial.println("[HANDOVER] Multiple handover requests detected");
+  }
+
+  int approvedIndex = 0;
+  for (int i = 1; i < handoverRequestCount; i++) {
+    if (handoverRequests[i].requestTime < handoverRequests[approvedIndex].requestTime) {
+      approvedIndex = i;
+    }
+  }
+
+  for (int i = 0; i < handoverRequestCount; i++) {
+    int runnerId = handoverRequests[i].runnerId;
+    if (i == approvedIndex) {
+      int nextRelayId = getNextHandoverRelayId();
+      int nextChannelId = getNextHandoverChannelId();
+      approvedRunnerId = runnerId;
+      Serial.print("[HANDOVER] Approved runner ");
+      Serial.println(runnerId);
+      prepareAckForRunner(runnerId, nextRelayId, nextChannelId);
+      addPendingRemove(runnerId);
+    } else {
+      Serial.print("[HANDOVER] Retry runner ");
+      Serial.println(runnerId);
+      prepareRetryForRunner(runnerId);
+    }
   }
 }
 
-bool isEmergencyDataPacket(String msg){
-  return startsWithPacket(msg, "DATA") && getField(msg, 10) == "E";
-}
-
-void handleReceivedPacket(String msg, int rssi, float snr){
-  if(isEmergencyDataPacket(msg)){
-    handleRunnerData(msg, rssi, snr);
-  }else if(currentState == WAIT_SCHEDULE &&
-      startsWithPacket(msg, "SCHEDULE")){
-    parseSchedule(msg);
-  }else if(currentState == COLLECT_RUNNER_DATA &&
-             startsWithPacket(msg, "DATA")){
-    handleRunnerData(msg, rssi, snr);
-  }else if(startsWithPacket(msg, "HANDOVER")){
-    handleHandoverPacket(msg);
-  }else if((currentState == COLLECT_RUNNER_DATA ||
-              currentState == WAIT_SEND_NOW)&&
-             startsWithPacket(msg, "SEND_NOW")){
-    handleSendNowPacket(msg);
-  }else {
-    Serial.print("[RX] Ignored in state ");
-    Serial.println(stateName(currentState));
+int getNextHandoverRelayId() {
+  int target = nextHandoverRelayPointer;
+  nextHandoverRelayPointer++;
+  if (nextHandoverRelayPointer > 2) {
+    nextHandoverRelayPointer = 2;
   }
+  return target;
 }
 
-void sendEmergencyPacketToGateway(int cycleId, int runnerId,
-                                  String lat, String lng,
-                                  int pace, int battery,
-                                  char status, int seq,
-                                  int rssi, float snr){
-  String message = "EMERGENCY,";
-  message += String(cycleId);
-  message += ",";
-  message += String(RELAY_ID);
-  message += ",";
-  message += String(runnerId);
-  message += ",";
-  message += lat;
-  message += ",";
-  message += lng;
-  message += ",";
-  message += String(pace);
-  message += ",";
-  message += String(battery);
-  message += ",";
-  message += String(status);
-  message += ",";
-  message += String(seq);
-  message += ",";
-  message += String(rssi);
-  message += ",";
-  message += String(snr, 2);
-
-  Serial.print("[EMERGENCY][TX] ");
-  Serial.println(message);
-
-  sendLoRaMessage(message);
+int getNextHandoverChannelId() {
+  return 7;
 }
 
-void forwardBufferedPacketsToGateway(){
-  if(BATCH_FORWARD_MODE){
-    forwardBufferedPacketsBatchToGateway();
-  }else{
-    forwardBufferedPacketsOneByOneToGateway();
+void prepareAckForRunner(int runnerId, int nextRelayId, int nextChannelId) {
+  if (responsePacketCount >= MAX_HANDOVER_REQUESTS) {
+    return;
   }
+
+  int reserveSlotId = RELAY_ID;
+  int validFromCycle = cycleId + 1;
+  String msg = "HANDOVER_ACK,";
+  msg += String(cycleId);
+  msg += ",";
+  msg += String(runnerId);
+  msg += ",";
+  msg += String(RELAY_ID);
+  msg += ",";
+  msg += String(nextRelayId);
+  msg += ",";
+  msg += String(nextChannelId);
+  msg += ",";
+  msg += String(reserveSlotId);
+  msg += ",";
+  msg += String(validFromCycle);
+
+  responsePackets[responsePacketCount].valid = true;
+  responsePackets[responsePacketCount].message = msg;
+  responsePacketCount++;
 }
 
-void forwardBufferedPacketsOneByOneToGateway(){
-  Serial.print("[FORWARD] Sending ");
-  Serial.print(bufferCount);
-  Serial.println(" buffered packet(s) to Gateway");
-  updateOLED();
+void prepareRetryForRunner(int runnerId) {
+  if (responsePacketCount >= MAX_HANDOVER_REQUESTS) {
+    return;
+  }
 
-  for(int i = 0; i < bufferCount; i++){
+  String msg = "HANDOVER_RETRY,";
+  msg += String(cycleId);
+  msg += ",";
+  msg += String(runnerId);
+  msg += ",";
+  msg += String(cycleId + 1);
+
+  responsePackets[responsePacketCount].valid = true;
+  responsePackets[responsePacketCount].message = msg;
+  responsePacketCount++;
+}
+
+void sendNextHandoverResponseIfNeeded() {
+  if (responseCursor >= responsePacketCount) {
+    return;
+  }
+  if ((long)(millis() - nextResponseTime) < 0) {
+    return;
+  }
+
+  String msg = responsePackets[responseCursor].message;
+  if (startsWithPacket(msg, "HANDOVER_ACK")) {
+    Serial.println("[HANDOVER_ACK] sent");
+  } else if (startsWithPacket(msg, "HANDOVER_RETRY")) {
+    Serial.println("[HANDOVER_RETRY] sent");
+  }
+  sendLoRaMessage(msg);
+  responseCursor++;
+  nextResponseTime = millis() + RESPONSE_GAP_MS;
+}
+
+void applyPendingActiveListUpdates() {
+  for (int i = 0; i < pendingRemoveCount; i++) {
+    removeActiveRunner(pendingRemove[i]);
+  }
+  for (int i = 0; i < pendingAddCount; i++) {
+    addActiveRunner(pendingAdd[i]);
+  }
+  printActiveRunnerList("Updated Active Runner List");
+}
+
+void forwardBufferedPacketsToGateway() {
+  String start = "FORWARD_START,";
+  start += String(cycleId);
+  start += ",";
+  start += String(RELAY_ID);
+  start += ",";
+  start += String(bufferCount);
+  sendLoRaMessage(start);
+
+  for (int i = 0; i < bufferCount; i++) {
     RunnerData &data = relayBuffer[i];
-
-    // FORWARD,cycle_id,relay_id,runner_id,lat,lng,pace,battery,seq,rssi,snr
-    String message = "FORWARD,";
-    message += String(data.cycleId);
-    message += ",";
-    message += String(RELAY_ID);
-    message += ",";
-    message += String(data.runnerId);
-    message += ",";
-    message += data.lat;
-    message += ",";
-    message += data.lng;
-    message += ",";
-    message += String(data.pace);
-    message += ",";
-    message += String(data.battery);
-    message += ",";
-    message += String(data.seq);
-    message += ",";
-    message += String(data.rssi);
-    message += ",";
-    message += String(data.snr, 2);
-
-    sendLoRaMessage(message);
-
-    // 연속 송신으로 인한 Gateway 수신 누락 가능성을 줄인다.
-    delay(FORWARD_INTERVAL_MS);
+    String msg = "FORWARD_DATA,";
+    msg += String(cycleId);
+    msg += ",";
+    msg += String(RELAY_ID);
+    msg += ",";
+    msg += String(data.runnerId);
+    msg += ",";
+    msg += data.lat;
+    msg += ",";
+    msg += data.lng;
+    msg += ",";
+    msg += String(data.pace);
+    msg += ",";
+    msg += String(data.battery);
+    msg += ",";
+    msg += String(data.seq);
+    msg += ",";
+    msg += String(data.gpsValid);
+    msg += ",";
+    msg += String(data.rssi);
+    msg += ",";
+    msg += String(data.snr, 2);
+    sendLoRaMessage(msg);
+    delay(120);
   }
+
+  String done = "FORWARD_DONE,";
+  done += String(cycleId);
+  done += ",";
+  done += String(RELAY_ID);
+  done += ",";
+  done += String(bufferCount);
+  sendLoRaMessage(done);
+
+  Serial.print("[FORWARD] Forwarded Packet Count=");
+  Serial.println(bufferCount);
+  showOLED("Relay " + String(RELAY_ID),
+           "Cycle " + String(cycleId),
+           "Forward " + String(bufferCount),
+           "Ch " + String(currentChannelId));
 }
 
-void forwardBufferedPacketsBatchToGateway(){
-  Serial.print("[BATCH] Sending ");
-  Serial.print(bufferCount);
-  Serial.println(" buffered runner packet(s) in batch mode");
-  updateOLED();
-
-  int index = 0;
-
-  while(index < bufferCount){
-    int batchStart = index;
-    int batchCount = 0;
-    String entries = "";
-
-    while(index < bufferCount && batchCount < BATCH_MAX_ITEMS){
-      RunnerData &data = relayBuffer[index];
-
-      if(batchCount > 0){
-        entries += ";";
-      }
-
-      entries += String(data.runnerId);
-      entries += "|";
-      entries += data.lat;
-      entries += "|";
-      entries += data.lng;
-      entries += "|";
-      entries += String(data.pace);
-      entries += "|";
-      entries += String(data.battery);
-      entries += "|";
-      entries += String(data.seq);
-
-      batchCount++;
-      index++;
-    }
-
-    String message = "BATCH,";
-    message += String(relayBuffer[batchStart].cycleId);
-    message += ",";
-    message += String(RELAY_ID);
-    message += ",";
-    message += String(batchCount);
-    message += ",";
-    message += entries;
-
-    Serial.print("[BATCH][TX] ");
-    Serial.println(message);
-
-    sendLoRaMessage(message);
-    delay(FORWARD_INTERVAL_MS);
-  }
-}
-
-void sendDonePacket(){
-  // DONE,cycle_id,relay_id,count
-  String message = "DONE,";
-  message += String(activeCycleId);
-  message += ",";
-  message += String(RELAY_ID);
-  message += ",";
-  message += String(bufferCount);
-
-  sendLoRaMessage(message);
-}
-
-void handleSendNowPacket(String msg){
-  // SEND_NOW,cycle_id,target_relay_id
-  if(getField(msg, 0)!= "SEND_NOW" ||
-      getField(msg, 1).length()== 0 ||
-      getField(msg, 2).length()== 0 ||
-      getField(msg, 3).length()!= 0){
-    Serial.println("[SEND_NOW][ERROR] Invalid CSV format");
+void changeState(RelayState nextState) {
+  if (currentState == nextState) {
     return;
   }
-
-  int packetCycleId = getField(msg, 1).toInt();
-  int targetRelayId = getField(msg, 2).toInt();
-
-  if(packetCycleId != activeCycleId || targetRelayId != RELAY_ID){
-    Serial.println("[SEND_NOW] Ignored: cycle or target relay does not match");
-    return;
-  }
-
-  if(RELAY_ID != 2){
-    Serial.println("[SEND_NOW] Ignored: Relay1 does not require SEND_NOW");
-    return;
-  }
-
-  if(currentState == COLLECT_RUNNER_DATA){
-    pendingSendNow = true;
-    Serial.println("[SEND_NOW] Received early; forwarding after Runner phase");
-  }else if(currentState == WAIT_SEND_NOW){
-    Serial.println("[SEND_NOW] Valid command received");
-    changeState(FORWARD_TO_GATEWAY);
-  }
-}
-
-void startSelfTestCycle(){
-  if(!RELAY_SELF_TEST_MODE){
-    return;
-  }
-
-  if(currentState != WAIT_SCHEDULE){
-    return;
-  }
-
-  if((unsigned long)(millis() - lastSelfTestCycleTime) <
-      SELF_TEST_CYCLE_INTERVAL_MS){
-    return;
-  }
-
-  clearRelayBuffer();
-  activeCycleId = selfTestCycleId++;
-  relayCount = RELAYS_PER_CHANNEL_GROUP;
-  runnerCount = TOTAL_RUNNERS;
-  runnerSlotMs = SELF_TEST_RUNNER_SLOT_MS;
-  pendingSendNow = false;
-  selfTestNormalInjected = false;
-  selfTestEmergencyInjectCount = 0;
-  selfTestSendNowInjected = false;
-  selfTestNormalSeq = 1;
-  selfTestEmergencySeq = 1000 + activeCycleId;
-  scheduleReceivedTime = millis();
-  beaconSendTime = millis();
-
-  unsigned long beaconPhaseMs =
-      (unsigned long)RELAYS_PER_CHANNEL_GROUP * RELAY_BEACON_SLOT_MS;
-  unsigned long runnerPhaseMs =
-      (unsigned long)RELAY_MAX_COUNT * (unsigned long)runnerSlotMs;
-  runnerPhaseEndTime =
-      millis() + beaconPhaseMs + PHASE_GUARD_MS + runnerPhaseMs;
-  lastSelfTestCycleTime = millis();
-
-  Serial.println();
-  Serial.println("[SELF_TEST] Starting Relay self-test cycle");
-  Serial.print("[SELF_TEST] cycle=");
-  Serial.print(activeCycleId);
-  Serial.print(", relay=");
-  Serial.print(RELAY_ID);
-  Serial.print(", runnerSlotMs=");
-  Serial.println(runnerSlotMs);
-
-  changeState(SEND_BEACON);
-}
-
-void injectSelfTestRunnerPacketsIfNeeded(){
-  if(!RELAY_SELF_TEST_MODE){
-    return;
-  }
-
-  if(currentState != COLLECT_RUNNER_DATA){
-    return;
-  }
-
-  unsigned long elapsed = millis() - stateStartTime;
-
-  if(SELF_TEST_RUNNER_NORMAL_ENABLE &&
-     !selfTestNormalInjected &&
-     elapsed >= SELF_TEST_NORMAL_DATA_DELAY_MS){
-    String message =
-        makeSelfTestRunnerDataPacket(activeCycleId,
-                                     SELF_TEST_NORMAL_RUNNER_ID,
-                                     RELAY_ID,
-                                     'M',
-                                     selfTestNormalSeq);
-
-    Serial.print("[SELF_TEST RUNNER] Inject normal DATA: ");
-    Serial.println(message);
-    handleRunnerData(message, SELF_TEST_DUMMY_RSSI, SELF_TEST_DUMMY_SNR);
-    selfTestNormalInjected = true;
-  }
-
-  if(SELF_TEST_RUNNER_EMERGENCY_ENABLE &&
-     selfTestEmergencyInjectCount < SELF_TEST_EMERGENCY_RETRY_COUNT){
-    unsigned long emergencyDelay =
-        SELF_TEST_EMERGENCY_START_DELAY_MS +
-        (unsigned long)selfTestEmergencyInjectCount *
-            SELF_TEST_EMERGENCY_RETRY_INTERVAL_MS;
-
-    if(elapsed >= emergencyDelay){
-      String message =
-          makeSelfTestRunnerDataPacket(activeCycleId,
-                                       SELF_TEST_EMERGENCY_RUNNER_ID,
-                                       0,
-                                       'E',
-                                       selfTestEmergencySeq);
-
-      Serial.print("[SELF_TEST RUNNER] Inject EMERGENCY retry ");
-      Serial.print(selfTestEmergencyInjectCount + 1);
-      Serial.print("/");
-      Serial.print(SELF_TEST_EMERGENCY_RETRY_COUNT);
-      Serial.print(": ");
-      Serial.println(message);
-      handleRunnerData(message, SELF_TEST_DUMMY_RSSI, SELF_TEST_DUMMY_SNR);
-      selfTestEmergencyInjectCount++;
-    }
-  }
-}
-
-String makeSelfTestRunnerDataPacket(int cycleId, int runnerId,
-                                    int targetRelayId, char status,
-                                    int seq){
-  String lat = "36.103210";
-  String lng = "129.387120";
-  int pace = 342;
-  int battery = 78;
-
-  if(status == 'E'){
-    lat = "36.103500";
-    lng = "129.387500";
-    pace = 410;
-    battery = 80;
-  }
-
-  String message = "DATA,";
-  message += String(cycleId);
-  message += ",";
-  message += String(runnerId);
-  message += ",";
-  message += String(targetRelayId);
-  message += ",";
-  message += lat;
-  message += ",";
-  message += lng;
-  message += ",";
-  message += String(pace);
-  message += ",";
-  message += String(battery);
-  message += ",";
-  message += String(seq);
-  message += ",1,";
-  message += String(status);
-
-  return message;
-}
-
-void injectSelfTestSendNowIfNeeded(){
-  if(!RELAY_SELF_TEST_MODE ||
-     selfTestSendNowInjected ||
-     currentState != WAIT_SEND_NOW ||
-     RELAY_ID != 2){
-    return;
-  }
-
-  String message = "SEND_NOW,";
-  message += String(activeCycleId);
-  message += ",";
-  message += String(RELAY_ID);
-
-  Serial.print("[SELF_TEST GATEWAY] Inject SEND_NOW: ");
-  Serial.println(message);
-  handleSendNowPacket(message);
-  selfTestSendNowInjected = true;
-}
-
-void selfTestGatewayReceive(String msg){
-  if(!RELAY_SELF_TEST_MODE){
-    return;
-  }
-
-  Serial.println();
-  Serial.println("========== [SELF_TEST GATEWAY RX] ==========");
-
-  if(startsWithPacket(msg, "EMERGENCY")){
-    Serial.println("[SELF_TEST GATEWAY] EMERGENCY RECEIVED");
-    Serial.print("[SELF_TEST GATEWAY][EMERGENCY] ");
-    Serial.println(msg);
-
-    int cycleId = getField(msg, 1).toInt();
-    int relayId = getField(msg, 2).toInt();
-    int runnerId = getField(msg, 3).toInt();
-    String lat = getField(msg, 4);
-    String lng = getField(msg, 5);
-    int pace = getField(msg, 6).toInt();
-    int battery = getField(msg, 7).toInt();
-    String status = getField(msg, 8);
-    int seq = getField(msg, 9).toInt();
-
-    Serial.print("cycle=");
-    Serial.print(cycleId);
-    Serial.print(", relay=");
-    Serial.print(relayId);
-    Serial.print(", runner=");
-    Serial.print(runnerId);
-    Serial.print(", status=");
-    Serial.print(status);
-    Serial.print(", seq=");
-    Serial.print(seq);
-    Serial.print(", lat=");
-    Serial.print(lat);
-    Serial.print(", lng=");
-    Serial.print(lng);
-    Serial.print(", pace=");
-    Serial.print(pace);
-    Serial.print(", battery=");
-    Serial.println(battery);
-  }
-
-  else if(startsWithPacket(msg, "FORWARD")){
-    Serial.println("[SELF_TEST GATEWAY] FORWARD RECEIVED");
-    Serial.print("[SELF_TEST GATEWAY][FORWARD] ");
-    Serial.println(msg);
-
-    int cycleId = getField(msg, 1).toInt();
-    int relayId = getField(msg, 2).toInt();
-    int runnerId = getField(msg, 3).toInt();
-    String lat = getField(msg, 4);
-    String lng = getField(msg, 5);
-    int pace = getField(msg, 6).toInt();
-    int battery = getField(msg, 7).toInt();
-    int seq = getField(msg, 8).toInt();
-
-    Serial.print("cycle=");
-    Serial.print(cycleId);
-    Serial.print(", relay=");
-    Serial.print(relayId);
-    Serial.print(", runner=");
-    Serial.print(runnerId);
-    Serial.print(", seq=");
-    Serial.print(seq);
-    Serial.print(", lat=");
-    Serial.print(lat);
-    Serial.print(", lng=");
-    Serial.print(lng);
-    Serial.print(", pace=");
-    Serial.print(pace);
-    Serial.print(", battery=");
-    Serial.println(battery);
-  }
-
-  else if(startsWithPacket(msg, "BATCH")){
-    Serial.println("[SELF_TEST GATEWAY] BATCH RECEIVED");
-    Serial.print("[SELF_TEST GATEWAY][BATCH] ");
-    Serial.println(msg);
-
-    int cycleId = getField(msg, 1).toInt();
-    int relayId = getField(msg, 2).toInt();
-    int batchCount = getField(msg, 3).toInt();
-    String entries = getField(msg, 4);
-
-    Serial.print("cycle=");
-    Serial.print(cycleId);
-    Serial.print(", relay=");
-    Serial.print(relayId);
-    Serial.print(", batch_count=");
-    Serial.print(batchCount);
-    Serial.print(", entries=");
-    Serial.println(entries);
-  }
-
-  else if(startsWithPacket(msg, "DONE")){
-    Serial.println("[SELF_TEST GATEWAY] DONE RECEIVED");
-    Serial.print("[SELF_TEST GATEWAY][DONE] ");
-    Serial.println(msg);
-
-    selfTestGatewayHandleDone(msg);
-  }
-
-  else if(startsWithPacket(msg, "BEACON")){
-    Serial.println("[SELF_TEST GATEWAY] BEACON observed");
-    Serial.print("[SELF_TEST GATEWAY][BEACON] ");
-    Serial.println(msg);
-  }
-
-  else {
-    Serial.println("[SELF_TEST GATEWAY] UNKNOWN PACKET");
-    Serial.println(msg);
-  }
-
-  Serial.println("========================================");
-  Serial.println();
-}
-
-void selfTestGatewayHandleDone(String msg){
-  // DONE,cycle_id,relay_id,count
-  int cycleId = getField(msg, 1).toInt();
-  int relayId = getField(msg, 2).toInt();
-  int count = getField(msg, 3).toInt();
-
-  Serial.print("[SELF_TEST GATEWAY] cycle=");
-  Serial.print(cycleId);
-  Serial.print(", relay=");
-  Serial.print(relayId);
-  Serial.print(", forwarded_count=");
-  Serial.println(count);
-
-  if(relayId == 1){
-    Serial.println("[SELF_TEST GATEWAY] Relay1 finished.");
-    Serial.println("[SELF_TEST GATEWAY] In real gateway, SEND_NOW would be sent to Relay2.");
-  }
-
-  if(relayId == 2){
-    Serial.println("[SELF_TEST GATEWAY] Relay2 finished. Cycle complete.");
-  }
-}
-
-void clearRelayBuffer(){
-  for(int i = 0; i < MAX_BUFFER_SIZE; i++){
-    relayBuffer[i].cycleId = -1;
-    relayBuffer[i].relayId = -1;
-    relayBuffer[i].runnerId = -1;
-    relayBuffer[i].lat = "";
-    relayBuffer[i].lng = "";
-    relayBuffer[i].pace = 0;
-    relayBuffer[i].battery = 0;
-    relayBuffer[i].status = 'M';
-    relayBuffer[i].seq = -1;
-    relayBuffer[i].rssi = -999;
-    relayBuffer[i].snr = -999.0;
-  }
-
-  bufferCount = 0;
-}
-
-void changeState(RelayState nextState){
-  if(currentState != nextState){
-    Serial.print("[STATE] ");
-    Serial.print(stateName(currentState));
-    Serial.print(" -> ");
-    Serial.println(stateName(nextState));
-  }
-
+  Serial.print("[STATE] ");
+  Serial.print(stateName(currentState));
+  Serial.print(" -> ");
+  Serial.println(stateName(nextState));
   currentState = nextState;
   stateStartTime = millis();
-  updateOLED();
 }
 
-const char *stateName(RelayState state){
-  switch(state){
-    case WAIT_SCHEDULE:
-      return "WAIT_SCHEDULE";
-    case SEND_BEACON:
-      return "SEND_BEACON";
-    case COLLECT_RUNNER_DATA:
-      return "COLLECT_RUNNER";
+const char *stateName(RelayState state) {
+  switch (state) {
+    case BUILD_SLOT_TABLE:
+      return "BUILD_SLOT_TABLE";
+    case SEND_SCHEDULE:
+      return "SEND_SCHEDULE";
+    case LISTEN_RESERVE_SLOTS:
+      return "LISTEN_RESERVE_SLOTS";
+    case LISTEN_REGULAR_SLOTS:
+      return "LISTEN_REGULAR_SLOTS";
+    case PROCESS_HANDOVER:
+      return "PROCESS_HANDOVER";
+    case SEND_HANDOVER_RESPONSE:
+      return "SEND_HANDOVER_RESPONSE";
+    case UPDATE_ACTIVE_RUNNER_LIST:
+      return "UPDATE_ACTIVE_RUNNER_LIST";
     case FORWARD_TO_GATEWAY:
-      return "FORWARD_GATEWAY";
-    case WAIT_SEND_NOW:
-      return "WAIT_SEND_NOW";
+      return "FORWARD_TO_GATEWAY";
     case CYCLE_DONE:
       return "CYCLE_DONE";
-    default:
-      return "UNKNOWN";
+    case EMERGENCY_LISTEN:
+      return "EMERGENCY_LISTEN";
   }
-}
-
-void updateOLED(){
-  String cycleLine =
-     (activeCycleId >= 0)? "Cycle: " + String(activeCycleId): "Cycle: -";
-  showOLED("Relay " + String(RELAY_ID), String(stateName(currentState)),
-           cycleLine, "Buffer: " + String(bufferCount));
+  return "UNKNOWN";
 }

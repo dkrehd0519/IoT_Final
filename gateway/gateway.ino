@@ -4,18 +4,22 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// TTGO LoRa32-OLED 보드 버전에 따라 핀 수정이 필요할 수 있다.
+// 기존 통신 테스트를 통과한 TTGO LoRa32-OLED 환경 설정은 유지한다.
 #define LORA_SS 18
 #define LORA_RST 14
 #define LORA_DIO0 26
 
-// TTGO LoRa32-OLED 보드 버전에 따라 I2C/OLED 설정 수정이 필요할 수 있다.
 #define OLED_SDA 4
 #define OLED_SCL 15
 #define OLED_ADDRESS 0x3C
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
+
+// 데모 실행 시 Gateway 장치마다 아래 값을 변경한다.
+#define DEMO_SCENARIO 1
+#define GATEWAY_ID 1
+#define CHANNEL_ID 1
 
 #define LORA_FREQUENCY 915E6
 #define LORA_SYNC_WORD 0x33
@@ -25,6 +29,7 @@
 #define LORA_CODING_RATE_DENOMINATOR 5
 #define LORA_PREAMBLE_LENGTH 8
 
+// 기존에 검증한 실제 주파수 테이블은 유지하고, 데모 channel id만 논리적으로 매핑한다.
 const long CHANNEL_FREQ_HZ[] = {
   915000000,
   916000000,
@@ -33,103 +38,94 @@ const long CHANNEL_FREQ_HZ[] = {
   919000000,
 };
 
-#define TOTAL_RELAYS 40
-#define CHANNEL_GROUP_COUNT 5
-#define RELAYS_PER_CHANNEL_GROUP \
-  ((TOTAL_RELAYS + CHANNEL_GROUP_COUNT - 1) / CHANNEL_GROUP_COUNT)
-#define RELAY_COUNT RELAYS_PER_CHANNEL_GROUP
-#define RUNNER_COUNT 3
-#define RUNNER_SLOT_MS 150
-#define MAX_RUNNERS RUNNER_COUNT
-#define GATEWAY_GROUP_INDEX 0
-
-#define RELAY1_ID 1
-#define RELAY2_ID 2
-
-// Runner 3명 기준:
-// Runner phase 종료 약 4.5초 + 최대 3개 forwarding 약 1.2초를 고려한다.
-#define RELAY1_TIMEOUT_MS 8000UL
-#define RELAY2_TIMEOUT_MS 5000UL
-#define CYCLE_GUARD_MS 1000UL
+#define MAX_FORWARD_DATA 8
+#define FORWARD_TIMEOUT_MS 6000UL
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool oledReady = false;
 
 enum GatewayState {
-  START_CYCLE,
-  WAIT_RELAY1_DATA,
-  SEND_RELAY2_START,
-  WAIT_RELAY2_DATA,
-  CYCLE_DONE
+  WAIT_FORWARD_START,
+  RECEIVE_FORWARD_DATA,
+  WAIT_FORWARD_DONE,
+  PRINT_OR_SEND_TO_SERVER
 };
 
-GatewayState currentState = START_CYCLE;
+struct ForwardData {
+  int cycleId;
+  int relayId;
+  int runnerId;
+  String lat;
+  String lng;
+  int pace;
+  int battery;
+  unsigned long seq;
+  int gpsValid;
+  int runnerRssi;
+  float runnerSnr;
+};
 
-unsigned long cycleId = 1;
+GatewayState currentState = WAIT_FORWARD_START;
+
+ForwardData forwardBuffer[MAX_FORWARD_DATA];
+int forwardCount = 0;
+int expectedForwardCount = -1;
+int currentCycleId = -1;
+int currentRelayId = -1;
 unsigned long stateStartTime = 0;
-
-int relay1PacketCount = 0;
-int relay2PacketCount = 0;
-int relay1DoneCount = -1;
-int relay2DoneCount = -1;
-bool relay1TimedOut = false;
-bool relay2TimedOut = false;
-int lastGatewayEmergencySeq[MAX_RUNNERS + 1];
+int currentChannelId = CHANNEL_ID;
 
 void showOLED(String line1, String line2 = "", String line3 = "", String line4 = "");
-void sendLoRaMessage(String msg);
 bool receiveLoRaMessage(String &msg, int &rssi, float &snr);
 bool startsWithPacket(String msg, String type);
 String getField(String msg, int index);
-String getDelimitedField(String msg, int index, char delimiter);
-long getGatewayChannelFrequencyHz();
-void sendSchedulePacket();
-void sendRelay2StartPacket();
-void handleForwardPacket(String msg, int rssi, float snr);
-void handleBatchForwardPacket(String msg, int rssi, float snr);
-void handleDonePacket(String msg);
+long getFrequencyByChannel(int channelId);
+int getEffectiveChannelId();
+bool isEmergencyGateway();
+void handleForwardStart(String msg);
+void handleForwardData(String msg, int relayRssi, float relaySnr);
+void handleForwardDone(String msg);
+void handleEmergencyForward(String msg);
+void printAndSendCycleData();
+void sendToServerStub(ForwardData data);
 void changeState(GatewayState nextState);
 const char *stateName(GatewayState state);
-void updateWaitingOLED();
-void handleEmergencyPacket(String msg, int rssi, float snr);
 
-void setup(){
+void setup() {
   Serial.begin(115200);
   delay(1000);
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" TTGO LoRa32 Marathon Gateway Node");
+  Serial.println(" TTGO LoRa32 Marathon Gateway Demo");
   Serial.println("========================================");
+  Serial.print("[CONFIG] DEMO_SCENARIO=");
+  Serial.println(DEMO_SCENARIO);
+  Serial.print("[CONFIG] GATEWAY_ID=");
+  Serial.println(GATEWAY_ID);
+  Serial.println("[CONFIG] LoRa/OLED pin and LoRa settings kept from tested code");
 
-  // 보드 버전에 따라 OLED_SDA/OLED_SCL 핀 수정이 필요할 수 있다.
   Wire.begin(OLED_SDA, OLED_SCL);
   oledReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
-
-  if(oledReady){
+  if (oledReady) {
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
-    showOLED("Gateway Boot", "OLED ready", "LoRa init...");
-    Serial.println("[OLED] Initialization complete");
-  } else {
-    Serial.println("[OLED][WARN] Initialization failed. Gateway continues without OLED.");
   }
 
-  // 보드 버전에 따라 LoRa 핀 수정이 필요할 수 있다.
+  currentChannelId = getEffectiveChannelId();
+
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  long gatewayFrequency = getGatewayChannelFrequencyHz();
+  long freq = getFrequencyByChannel(currentChannelId);
+  Serial.print("[CHANNEL] logical=");
+  Serial.print(currentChannelId);
+  Serial.print(", freq=");
+  Serial.println(freq);
 
-  Serial.print("[CHANNEL] Gateway group=");
-  Serial.print(GATEWAY_GROUP_INDEX + 1);
-  Serial.print(", frequency=");
-  Serial.println(gatewayFrequency);
-
-  if(!LoRa.begin(gatewayFrequency)){
+  if (!LoRa.begin(freq)) {
     Serial.println("[ERROR] LoRa initialization failed. Check wiring and board pins.");
-    showOLED("LoRa ERROR", "Check pins", "Gateway stopped");
-
-    while(true){
+    showOLED("LoRa ERROR", "Gateway " + String(GATEWAY_ID), "Check pins");
+    while (true) {
       delay(1000);
     }
   }
@@ -143,96 +139,48 @@ void setup(){
   LoRa.enableCrc();
   LoRa.receive();
 
-  Serial.println("[LoRa] Initialization complete");
-  Serial.println("[LoRa] 915 MHz, SF7, BW125 kHz, CR4/5, SyncWord 0x33, CRC ON");
-
-  for(int i = 0; i <= MAX_RUNNERS; i++){
-    lastGatewayEmergencySeq[i] = -1;
-  }
-
-  currentState = START_CYCLE;
-  stateStartTime = millis();
+  showOLED("Gateway " + String(GATEWAY_ID),
+           "Scenario " + String(DEMO_SCENARIO),
+           "Channel " + String(currentChannelId),
+           isEmergencyGateway() ? "Emergency" : "Normal");
+  changeState(WAIT_FORWARD_START);
 }
 
-void loop(){
-  // Relay 수신 단계에서만 LoRa packet을 처리한다.
-  if(currentState == WAIT_RELAY1_DATA || currentState == WAIT_RELAY2_DATA){
-    String message;
-    int rssi = 0;
-    float snr = 0.0;
+void loop() {
+  String message;
+  int rssi = 0;
+  float snr = 0.0;
 
-    if(receiveLoRaMessage(message, rssi, snr)){
-      if(startsWithPacket(message, "EMERGENCY")){
-        handleEmergencyPacket(message, rssi, snr);
-      } else if(startsWithPacket(message, "BATCH")){
-        handleBatchForwardPacket(message, rssi, snr);
-      } else if(startsWithPacket(message, "FORWARD")){
-        handleForwardPacket(message, rssi, snr);
-      } else if(startsWithPacket(message, "DONE")){
-        handleDonePacket(message);
-      } else {
-        Serial.println("[RX] Ignored: expected EMERGENCY, BATCH, FORWARD or DONE packet");
-      }
+  if (receiveLoRaMessage(message, rssi, snr)) {
+    if (startsWithPacket(message, "FORWARD_START")) {
+      handleForwardStart(message);
+    } else if (startsWithPacket(message, "FORWARD_DATA")) {
+      handleForwardData(message, rssi, snr);
+    } else if (startsWithPacket(message, "FORWARD_DONE")) {
+      handleForwardDone(message);
+    } else if (startsWithPacket(message, "EMERGENCY_FORWARD")) {
+      handleEmergencyForward(message);
+    } else {
+      Serial.println("[RX] Ignored packet for Gateway");
     }
   }
 
-  switch(currentState){
-    case START_CYCLE:
-      relay1PacketCount = 0;
-      relay2PacketCount = 0;
-      relay1DoneCount = -1;
-      relay2DoneCount = -1;
-      relay1TimedOut = false;
-      relay2TimedOut = false;
+  if ((currentState == RECEIVE_FORWARD_DATA || currentState == WAIT_FORWARD_DONE) &&
+      (unsigned long)(millis() - stateStartTime) >= FORWARD_TIMEOUT_MS) {
+    Serial.println("[GATEWAY][TIMEOUT] Forwarding sequence timed out. Reset to WAIT_FORWARD_START.");
+    changeState(WAIT_FORWARD_START);
+  }
 
-      Serial.println();
-      Serial.print("[CYCLE] Starting cycle ");
-      Serial.println(cycleId);
-      showOLED("START_CYCLE", "Cycle: " + String(cycleId), "Sending schedule", "R1:0  R2:0");
-
-      sendSchedulePacket();
-      changeState(WAIT_RELAY1_DATA);
-      break;
-
-    case WAIT_RELAY1_DATA:
-      if((unsigned long)(millis()- stateStartTime)>= RELAY1_TIMEOUT_MS){
-        relay1TimedOut = true;
-        Serial.print("[TIMEOUT] Relay1 DONE not received within ");
-        Serial.print(RELAY1_TIMEOUT_MS);
-        Serial.println(" ms. Moving to Relay2.");
-        changeState(SEND_RELAY2_START);
-      }
-      break;
-
-    case SEND_RELAY2_START:
-      sendRelay2StartPacket();
-      changeState(WAIT_RELAY2_DATA);
-      break;
-
-    case WAIT_RELAY2_DATA:
-      if((unsigned long)(millis()- stateStartTime)>= RELAY2_TIMEOUT_MS){
-        relay2TimedOut = true;
-        Serial.print("[TIMEOUT] Relay2 DONE not received within ");
-        Serial.print(RELAY2_TIMEOUT_MS);
-        Serial.println(" ms. Ending cycle.");
-        changeState(CYCLE_DONE);
-      }
-      break;
-
-    case CYCLE_DONE:
-      if((unsigned long)(millis()- stateStartTime)>= CYCLE_GUARD_MS){
-        cycleId++;
-        changeState(START_CYCLE);
-      }
-      break;
+  if (currentState == PRINT_OR_SEND_TO_SERVER) {
+    printAndSendCycleData();
+    changeState(WAIT_FORWARD_START);
   }
 }
 
-void showOLED(String line1, String line2, String line3, String line4){
-  if(!oledReady){
+void showOLED(String line1, String line2, String line3, String line4) {
+  if (!oledReady) {
     return;
   }
-
   display.clearDisplay();
   display.setCursor(0, 0);
   display.println(line1);
@@ -242,34 +190,17 @@ void showOLED(String line1, String line2, String line3, String line4){
   display.display();
 }
 
-void sendLoRaMessage(String msg){
-  // 송신 전 standby로 전환하고, 송신 완료 후 다시 수신 모드로 복귀한다.
-  LoRa.idle();
-  LoRa.beginPacket();
-  LoRa.print(msg);
-
-  if(LoRa.endPacket()== 1){
-    Serial.print("[TX] ");
-    Serial.println(msg);
-  } else {
-    Serial.println("[TX][ERROR] LoRa transmission failed");
-  }
-
-  LoRa.receive();
-}
-
-bool receiveLoRaMessage(String &msg, int &rssi, float &snr){
+bool receiveLoRaMessage(String &msg, int &rssi, float &snr) {
   int packetSize = LoRa.parsePacket();
-  if(packetSize == 0){
+  if (packetSize == 0) {
     return false;
   }
 
   msg = "";
-  while(LoRa.available()){
-    msg +=(char)LoRa.read();
+  while (LoRa.available()) {
+    msg += (char)LoRa.read();
   }
   msg.trim();
-
   rssi = LoRa.packetRssi();
   snr = LoRa.packetSnr();
 
@@ -280,499 +211,276 @@ bool receiveLoRaMessage(String &msg, int &rssi, float &snr){
   Serial.print(" dBm, SNR=");
   Serial.print(snr, 2);
   Serial.println(" dB");
-
   return true;
 }
 
-bool startsWithPacket(String msg, String type){
+bool startsWithPacket(String msg, String type) {
   msg.trim();
   type.trim();
   return msg == type || msg.startsWith(type + ",");
 }
 
-String getField(String msg, int index){
-  if(index < 0){
+String getField(String msg, int index) {
+  if (index < 0) {
     return "";
   }
 
   int fieldStart = 0;
   int currentIndex = 0;
-
-  for(int i = 0; i <= msg.length(); i++){
-    if(i == msg.length()|| msg.charAt(i)== ','){
-      if(currentIndex == index){
+  for (int i = 0; i <= msg.length(); i++) {
+    if (i == msg.length() || msg.charAt(i) == ',') {
+      if (currentIndex == index) {
         String field = msg.substring(fieldStart, i);
         field.trim();
         return field;
       }
-
       currentIndex++;
       fieldStart = i + 1;
     }
   }
-
   return "";
 }
 
-String getDelimitedField(String msg, int index, char delimiter){
-  if(index < 0){
-    return "";
-  }
-
-  int fieldStart = 0;
-  int currentIndex = 0;
-
-  for(int i = 0; i <= msg.length(); i++){
-    if(i == msg.length() || msg.charAt(i) == delimiter){
-      if(currentIndex == index){
-        String field = msg.substring(fieldStart, i);
-        field.trim();
-        return field;
-      }
-
-      currentIndex++;
-      fieldStart = i + 1;
+long getFrequencyByChannel(int channelId) {
+  int index = 0;
+  if (channelId == 1) {
+    index = 0;
+  } else if (channelId == 2) {
+    index = 1;
+  } else if (channelId == 7) {
+    index = 2;
+  } else if (channelId == 13) {
+    index = 3;
+  } else {
+    index = (channelId - 1) % 5;
+    if (index < 0) {
+      index = 0;
     }
   }
-
-  return "";
+  return CHANNEL_FREQ_HZ[index];
 }
 
-long getGatewayChannelFrequencyHz(){
-  int channelCount = sizeof(CHANNEL_FREQ_HZ) / sizeof(CHANNEL_FREQ_HZ[0]);
-  int groupIndex = GATEWAY_GROUP_INDEX;
-
-  if(groupIndex < 0){
-    groupIndex = 0;
+int getEffectiveChannelId() {
+  if (DEMO_SCENARIO == 1) {
+    return (GATEWAY_ID == 2) ? 2 : 1;
   }
-
-  if(groupIndex >= channelCount){
-    groupIndex = channelCount - 1;
+  if (DEMO_SCENARIO == 2) {
+    return (GATEWAY_ID == 2) ? 7 : 1;
   }
-
-  return CHANNEL_FREQ_HZ[groupIndex];
+  if (DEMO_SCENARIO == 3) {
+    return (GATEWAY_ID == 2) ? 13 : 1;
+  }
+  return CHANNEL_ID;
 }
 
-void sendSchedulePacket(){
-  // SCHEDULE,cycle_id,relay_count,runner_count,runner_slot_ms
-  String message = "SCHEDULE,";
-  message += String(cycleId);
-  message += ",";
-  message += String(RELAY_COUNT);
-  message += ",";
-  message += String(RUNNER_COUNT);
-  message += ",";
-  message += String(RUNNER_SLOT_MS);
-
-  sendLoRaMessage(message);
+bool isEmergencyGateway() {
+  return DEMO_SCENARIO == 3 && GATEWAY_ID == 2;
 }
 
-void sendRelay2StartPacket(){
-  // SEND_NOW,cycle_id,target_relay_id
-  String message = "SEND_NOW,";
-  message += String(cycleId);
-  message += ",";
-  message += String(RELAY2_ID);
-
-  Serial.println("[CONTROL] Requesting Relay2 forwarding");
-  showOLED("SEND_RELAY2", "Cycle: " + String(cycleId),
-           "R1 packets: " + String(relay1PacketCount), "Sending SEND_NOW");
-  sendLoRaMessage(message);
-}
-
-void handleForwardPacket(String msg, int rssi, float snr){
-  // FORWARD,cycle_id,relay_id,runner_id,lat,lng,pace,battery,seq,rssi,snr
-  if(getField(msg, 0)!= "FORWARD" ||
-      getField(msg, 1).length()== 0 ||
-      getField(msg, 2).length()== 0 ||
-      getField(msg, 3).length()== 0 ||
-      getField(msg, 4).length()== 0 ||
-      getField(msg, 5).length()== 0 ||
-      getField(msg, 6).length()== 0 ||
-      getField(msg, 7).length()== 0 ||
-      getField(msg, 8).length()== 0 ||
-      getField(msg, 9).length()== 0 ||
-      getField(msg, 10).length()== 0 ||
-      getField(msg, 11).length()!= 0){
-    Serial.println("[FORWARD][ERROR] Invalid CSV format");
-    return;
-  }
-
-  unsigned long packetCycleId =(unsigned long)getField(msg, 1).toInt();
-  int relayId = getField(msg, 2).toInt();
-  int runnerId = getField(msg, 3).toInt();
-
-  if(packetCycleId != cycleId){
-    Serial.print("[FORWARD] Ignored: packet cycle ");
-    Serial.print(packetCycleId);
-    Serial.print(" does not match active cycle ");
-    Serial.println(cycleId);
-    return;
-  }
-
-  int expectedRelayId =
-     (currentState == WAIT_RELAY1_DATA)? RELAY1_ID : RELAY2_ID;
-  if(relayId != expectedRelayId){
-    Serial.print("[FORWARD] Ignored: expected relay ");
-    Serial.print(expectedRelayId);
-    Serial.print(", received relay ");
-    Serial.println(relayId);
-    return;
-  }
-
-  if(relayId == RELAY1_ID){
-    relay1PacketCount++;
-  } else if(relayId == RELAY2_ID){
-    relay2PacketCount++;
-  }
-
-  Serial.println("[FORWARD] Parsed runner data");
-  Serial.print("  cycle_id: ");
-  Serial.println(packetCycleId);
-  Serial.print("  relay_id: ");
-  Serial.println(relayId);
-  Serial.print("  runner_id: ");
-  Serial.println(runnerId);
-  Serial.print("  lat/lng: ");
-  Serial.print(getField(msg, 4));
-  Serial.print(", ");
-  Serial.println(getField(msg, 5));
-  Serial.print("  pace/battery/seq: ");
-  Serial.print(getField(msg, 6));
-  Serial.print(" / ");
-  Serial.print(getField(msg, 7));
-  Serial.print(" / ");
-  Serial.println(getField(msg, 8));
-  Serial.print("  Runner-to-Relay RSSI/SNR: ");
-  Serial.print(getField(msg, 9));
-  Serial.print(" dBm / ");
-  Serial.print(getField(msg, 10));
-  Serial.println(" dB");
-  Serial.print("  Relay-to-Gateway RSSI/SNR: ");
-  Serial.print(rssi);
-  Serial.print(" dBm / ");
-  Serial.print(snr, 2);
-  Serial.println(" dB");
-
-  // TODO: 이 지점에서 server HTTP 또는 MQTT publish 함수를 호출할 수 있다.
-  updateWaitingOLED();
-}
-
-void handleBatchForwardPacket(String msg, int rssi, float snr){
-  // BATCH,cycle_id,relay_id,batch_count,runnerId|lat|lng|pace|battery|seq;...
-  if(getField(msg, 0)!= "BATCH" ||
-      getField(msg, 1).length()== 0 ||
-      getField(msg, 2).length()== 0 ||
-      getField(msg, 3).length()== 0 ||
-      getField(msg, 4).length()== 0 ||
-      getField(msg, 5).length()!= 0){
-    Serial.println("[BATCH][ERROR] Invalid CSV format");
-    return;
-  }
-
-  unsigned long packetCycleId =(unsigned long)getField(msg, 1).toInt();
-  int relayId = getField(msg, 2).toInt();
-  int batchCount = getField(msg, 3).toInt();
-  String entries = getField(msg, 4);
-
-  if(packetCycleId != cycleId){
-    Serial.print("[BATCH] Ignored: packet cycle ");
-    Serial.print(packetCycleId);
-    Serial.print(" does not match active cycle ");
-    Serial.println(cycleId);
-    return;
-  }
-
-  int expectedRelayId =
-     (currentState == WAIT_RELAY1_DATA)? RELAY1_ID : RELAY2_ID;
-  if(relayId != expectedRelayId){
-    Serial.print("[BATCH] Ignored: expected relay ");
-    Serial.print(expectedRelayId);
-    Serial.print(", received relay ");
-    Serial.println(relayId);
-    return;
-  }
-
-  if(batchCount <= 0){
-    Serial.println("[BATCH][ERROR] Invalid batch_count");
-    return;
-  }
+void handleForwardStart(String msg) {
+  currentCycleId = getField(msg, 1).toInt();
+  currentRelayId = getField(msg, 2).toInt();
+  expectedForwardCount = getField(msg, 3).toInt();
+  forwardCount = 0;
 
   Serial.println();
-  Serial.print("[BATCH] Received batch from relay ");
-  Serial.print(relayId);
-  Serial.print(", count=");
-  Serial.println(batchCount);
+  Serial.println("[FORWARD_START] Gateway forwarding session started");
+  Serial.print("  cycle_id=");
+  Serial.println(currentCycleId);
+  Serial.print("  relay_id=");
+  Serial.println(currentRelayId);
+  Serial.print("  expected_count=");
+  Serial.println(expectedForwardCount);
 
-  int parsedCount = 0;
-  int entryStart = 0;
-
-  for(int i = 0; i <= entries.length(); i++){
-    if(i == entries.length() || entries.charAt(i) == ';'){
-      String entry = entries.substring(entryStart, i);
-      entry.trim();
-
-      if(entry.length() > 0){
-        String runnerIdField = getDelimitedField(entry, 0, '|');
-        String latField = getDelimitedField(entry, 1, '|');
-        String lngField = getDelimitedField(entry, 2, '|');
-        String paceField = getDelimitedField(entry, 3, '|');
-        String batteryField = getDelimitedField(entry, 4, '|');
-        String seqField = getDelimitedField(entry, 5, '|');
-
-        if(runnerIdField.length() == 0 ||
-           latField.length() == 0 ||
-           lngField.length() == 0 ||
-           paceField.length() == 0 ||
-           batteryField.length() == 0 ||
-           seqField.length() == 0 ||
-           getDelimitedField(entry, 6, '|').length() != 0){
-          Serial.println("[BATCH][ERROR] Invalid runner entry format");
-        }else{
-          int runnerId = runnerIdField.toInt();
-
-          if(relayId == RELAY1_ID){
-            relay1PacketCount++;
-          } else if(relayId == RELAY2_ID){
-            relay2PacketCount++;
-          }
-
-          Serial.println("[BATCH] Parsed runner data");
-          Serial.print("  cycle_id: ");
-          Serial.println(packetCycleId);
-          Serial.print("  relay_id: ");
-          Serial.println(relayId);
-          Serial.print("  runner_id: ");
-          Serial.println(runnerId);
-          Serial.print("  lat/lng: ");
-          Serial.print(latField);
-          Serial.print(", ");
-          Serial.println(lngField);
-          Serial.print("  pace/battery/seq: ");
-          Serial.print(paceField);
-          Serial.print(" / ");
-          Serial.print(batteryField);
-          Serial.print(" / ");
-          Serial.println(seqField);
-          Serial.print("  Relay-to-Gateway RSSI/SNR: ");
-          Serial.print(rssi);
-          Serial.print(" dBm / ");
-          Serial.print(snr, 2);
-          Serial.println(" dB");
-
-          updateWaitingOLED();
-          parsedCount++;
-        }
-      }
-
-      entryStart = i + 1;
-    }
-  }
-
-  if(parsedCount != batchCount){
-    Serial.print("[BATCH][WARN] batch_count=");
-    Serial.print(batchCount);
-    Serial.print(", parsed_count=");
-    Serial.println(parsedCount);
-  }
+  showOLED("Forward Start",
+           "Relay " + String(currentRelayId),
+           "Cycle " + String(currentCycleId),
+           "Count " + String(expectedForwardCount));
+  changeState(RECEIVE_FORWARD_DATA);
 }
 
-void handleDonePacket(String msg){
-  // DONE,cycle_id,relay_id,count
-  if(getField(msg, 0)!= "DONE" ||
-      getField(msg, 1).length()== 0 ||
-      getField(msg, 2).length()== 0 ||
-      getField(msg, 3).length()== 0 ||
-      getField(msg, 4).length()!= 0){
-    Serial.println("[DONE][ERROR] Invalid CSV format");
+void handleForwardData(String msg, int relayRssi, float relaySnr) {
+  if (forwardCount >= MAX_FORWARD_DATA) {
+    Serial.println("[FORWARD_DATA][WARN] Gateway buffer full");
     return;
   }
 
-  unsigned long packetCycleId =(unsigned long)getField(msg, 1).toInt();
+  int packetCycleId = getField(msg, 1).toInt();
   int relayId = getField(msg, 2).toInt();
-  int count = getField(msg, 3).toInt();
-
-  if(packetCycleId != cycleId || count < 0){
-    Serial.println("[DONE] Ignored: invalid cycle_id or count");
+  if (packetCycleId != currentCycleId || relayId != currentRelayId) {
+    Serial.println("[FORWARD_DATA] Ignored: cycle or relay mismatch");
     return;
   }
 
-  if(currentState == WAIT_RELAY1_DATA && relayId == RELAY1_ID){
-    relay1DoneCount = count;
-    Serial.print("[DONE] Relay1 complete. Reported count=");
-    Serial.print(relay1DoneCount);
-    Serial.print(", received FORWARD count=");
-    Serial.println(relay1PacketCount);
+  ForwardData &data = forwardBuffer[forwardCount++];
+  data.cycleId = packetCycleId;
+  data.relayId = relayId;
+  data.runnerId = getField(msg, 3).toInt();
+  data.lat = getField(msg, 4);
+  data.lng = getField(msg, 5);
+  data.pace = getField(msg, 6).toInt();
+  data.battery = getField(msg, 7).toInt();
+  data.seq = (unsigned long)getField(msg, 8).toInt();
+  data.gpsValid = getField(msg, 9).toInt();
+  data.runnerRssi = getField(msg, 10).toInt();
+  data.runnerSnr = getField(msg, 11).toFloat();
 
-    if(relay1DoneCount != relay1PacketCount){
-      Serial.println("[DONE][WARN] Relay1 reported count differs from received count");
-    }
+  Serial.println("[FORWARD_DATA] Gateway Received Data");
+  Serial.print("  relay_id=");
+  Serial.println(data.relayId);
+  Serial.print("  runner_id=");
+  Serial.println(data.runnerId);
+  Serial.print("  lat/lng=");
+  Serial.print(data.lat);
+  Serial.print(", ");
+  Serial.println(data.lng);
+  Serial.print("  pace/battery/seq=");
+  Serial.print(data.pace);
+  Serial.print(" / ");
+  Serial.print(data.battery);
+  Serial.print(" / ");
+  Serial.println(data.seq);
+  Serial.print("  runner_rssi/snr=");
+  Serial.print(data.runnerRssi);
+  Serial.print(" / ");
+  Serial.println(data.runnerSnr, 2);
+  Serial.print("  relay_to_gateway_rssi/snr=");
+  Serial.print(relayRssi);
+  Serial.print(" / ");
+  Serial.println(relaySnr, 2);
 
-    changeState(SEND_RELAY2_START);
-    return;
-  }
-
-  if(currentState == WAIT_RELAY2_DATA && relayId == RELAY2_ID){
-    relay2DoneCount = count;
-    Serial.print("[DONE] Relay2 complete. Reported count=");
-    Serial.print(relay2DoneCount);
-    Serial.print(", received FORWARD count=");
-    Serial.println(relay2PacketCount);
-
-    if(relay2DoneCount != relay2PacketCount){
-      Serial.println("[DONE][WARN] Relay2 reported count differs from received count");
-    }
-
-    changeState(CYCLE_DONE);
-    return;
-  }
-
-  Serial.print("[DONE] Ignored: unexpected relay ");
-  Serial.print(relayId);
-  Serial.print(" while state is ");
-  Serial.println(stateName(currentState));
+  changeState(WAIT_FORWARD_DONE);
 }
 
-void changeState(GatewayState nextState){
-  if(currentState != nextState){
-    Serial.print("[STATE] ");
-    Serial.print(stateName(currentState));
-    Serial.print(" -> ");
-    Serial.println(stateName(nextState));
-  }
+void handleForwardDone(String msg) {
+  int packetCycleId = getField(msg, 1).toInt();
+  int relayId = getField(msg, 2).toInt();
+  int reportedCount = getField(msg, 3).toInt();
 
-  currentState = nextState;
-  stateStartTime = millis();
-
-  if(nextState == WAIT_RELAY1_DATA || nextState == WAIT_RELAY2_DATA){
-    updateWaitingOLED();
-  } else if(nextState == CYCLE_DONE){
-    Serial.println("----------------------------------------");
-    Serial.print("[RESULT] Cycle ");
-    Serial.println(cycleId);
-    Serial.print("[RESULT] Relay1 FORWARD=");
-    Serial.print(relay1PacketCount);
-    Serial.print(", DONE count=");
-    Serial.print(relay1DoneCount);
-    Serial.print(", timeout=");
-    Serial.println(relay1TimedOut ? "YES" : "NO");
-    Serial.print("[RESULT] Relay2 FORWARD=");
-    Serial.print(relay2PacketCount);
-    Serial.print(", DONE count=");
-    Serial.print(relay2DoneCount);
-    Serial.print(", timeout=");
-    Serial.println(relay2TimedOut ? "YES" : "NO");
-    Serial.println("----------------------------------------");
-
-    String relay1Result = "R1:" + String(relay1PacketCount);
-    relay1Result += relay1TimedOut ? " TIMEOUT" : " DONE";
-    String relay2Result = "R2:" + String(relay2PacketCount);
-    relay2Result += relay2TimedOut ? " TIMEOUT" : " DONE";
-
-    showOLED("CYCLE_DONE", "Cycle: " + String(cycleId),
-             relay1Result, relay2Result);
-  }
-}
-
-void handleEmergencyPacket(String msg, int rssi, float snr){
-  // EMERGENCY,cycle_id,relay_id,runner_id,lat,lng,pace,battery,status,seq,runner_rssi,runner_snr
-
-  if(getField(msg, 0) != "EMERGENCY" ||
-     getField(msg, 1).length() == 0 ||
-     getField(msg, 2).length() == 0 ||
-     getField(msg, 3).length() == 0 ||
-     getField(msg, 4).length() == 0 ||
-     getField(msg, 5).length() == 0 ||
-     getField(msg, 6).length() == 0 ||
-     getField(msg, 7).length() == 0 ||
-     getField(msg, 8).length() == 0 ||
-     getField(msg, 9).length() == 0 ||
-     getField(msg, 10).length() == 0 ||
-     getField(msg, 11).length() == 0 ||
-     getField(msg, 12).length() != 0){
-    Serial.println("[EMERGENCY][ERROR] Invalid CSV format");
+  if (packetCycleId != currentCycleId || relayId != currentRelayId) {
+    Serial.println("[FORWARD_DONE] Ignored: cycle or relay mismatch");
     return;
   }
 
-  unsigned long packetCycleId = (unsigned long)getField(msg, 1).toInt();
+  Serial.println("[FORWARD_DONE] Gateway forwarding session complete");
+  Serial.print("  reported_count=");
+  Serial.println(reportedCount);
+  Serial.print("  received_count=");
+  Serial.println(forwardCount);
+  if (reportedCount != forwardCount) {
+    Serial.println("[FORWARD_DONE][WARN] reported_count differs from received_count");
+  }
+
+  changeState(PRINT_OR_SEND_TO_SERVER);
+}
+
+void handleEmergencyForward(String msg) {
+  if (!isEmergencyGateway()) {
+    return;
+  }
+
+  int emergencyId = getField(msg, 1).toInt();
   int relayId = getField(msg, 2).toInt();
   int runnerId = getField(msg, 3).toInt();
-  int seq = getField(msg, 9).toInt();
-
-  if(runnerId > 0 && runnerId <= MAX_RUNNERS){
-    if(lastGatewayEmergencySeq[runnerId] == seq){
-      Serial.print("[EMERGENCY][DUPLICATE] Already displayed. runner=");
-      Serial.print(runnerId);
-      Serial.print(", seq=");
-      Serial.println(seq);
-      return;
-    }
-
-    lastGatewayEmergencySeq[runnerId] = seq;
-  }
+  String lat = getField(msg, 4);
+  String lng = getField(msg, 5);
+  int battery = getField(msg, 6).toInt();
+  String timestamp = getField(msg, 7);
+  int gpsValid = getField(msg, 8).toInt();
+  int rssi = getField(msg, 9).toInt();
+  float snr = getField(msg, 10).toFloat();
 
   Serial.println();
-  Serial.println("🚨 [EMERGENCY RECEIVED]");
-  Serial.print("  cycle_id: ");
-  Serial.println(packetCycleId);
-  Serial.print("  relay_id: ");
-  Serial.println(relayId);
-  Serial.print("  runner_id: ");
+  Serial.println("========== EMERGENCY ALERT ==========");
+  Serial.print("Emergency ID: ");
+  Serial.println(emergencyId);
+  Serial.print("Runner ID: ");
   Serial.println(runnerId);
-
-  Serial.print("  lat/lng: ");
-  Serial.print(getField(msg, 4));
-  Serial.print(", ");
-  Serial.println(getField(msg, 5));
-
-  Serial.print("  pace/battery/status/seq: ");
-  Serial.print(getField(msg, 6));
-  Serial.print(" / ");
-  Serial.print(getField(msg, 7));
-  Serial.print(" / ");
-  Serial.print(getField(msg, 8));
-  Serial.print(" / ");
-  Serial.println(getField(msg, 9));
-
-  Serial.print("  Runner-to-Relay RSSI/SNR: ");
-  Serial.print(getField(msg, 10));
-  Serial.print(" dBm / ");
-  Serial.print(getField(msg, 11));
-  Serial.println(" dB");
-
-  Serial.print("  Relay-to-Gateway RSSI/SNR: ");
-  Serial.print(rssi);
-  Serial.print(" dBm / ");
-  Serial.print(snr, 2);
-  Serial.println(" dB");
+  Serial.print("Relay ID: ");
+  Serial.println(relayId);
+  Serial.print("Latitude: ");
+  Serial.println(lat);
+  Serial.print("Longitude: ");
+  Serial.println(lng);
+  Serial.print("Battery: ");
+  Serial.println(battery);
+  Serial.print("Timestamp: ");
+  Serial.println(timestamp);
+  Serial.print("GPS Valid: ");
+  Serial.println(gpsValid);
+  Serial.print("RSSI: ");
+  Serial.println(rssi);
+  Serial.print("SNR: ");
+  Serial.println(snr, 2);
+  Serial.println("=====================================");
 
   showOLED("!!! EMERGENCY !!!",
-           "Runner: " + String(runnerId),
-           "Relay: " + String(relayId),
-           getField(msg, 4) + "," + getField(msg, 5));
+           "Runner " + String(runnerId),
+           "Relay " + String(relayId),
+           "Batt " + String(battery));
 }
 
-const char *stateName(GatewayState state){
-  switch(state){
-    case START_CYCLE:
-      return "START_CYCLE";
-    case WAIT_RELAY1_DATA:
-      return "WAIT_RELAY1_DATA";
-    case SEND_RELAY2_START:
-      return "SEND_RELAY2_START";
-    case WAIT_RELAY2_DATA:
-      return "WAIT_RELAY2_DATA";
-    case CYCLE_DONE:
-      return "CYCLE_DONE";
-    default:
-      return "UNKNOWN";
+void printAndSendCycleData() {
+  Serial.println();
+  Serial.println("[CYCLE_RESULT] Gateway Received Data Summary");
+  Serial.print("  cycle_id=");
+  Serial.println(currentCycleId);
+  Serial.print("  relay_id=");
+  Serial.println(currentRelayId);
+  Serial.print("  received_count=");
+  Serial.println(forwardCount);
+
+  for (int i = 0; i < forwardCount; i++) {
+    ForwardData &data = forwardBuffer[i];
+    Serial.print("  Runner ");
+    Serial.print(data.runnerId);
+    Serial.print(" -> lat=");
+    Serial.print(data.lat);
+    Serial.print(", lng=");
+    Serial.print(data.lng);
+    Serial.print(", pace=");
+    Serial.print(data.pace);
+    Serial.print(", battery=");
+    Serial.println(data.battery);
+    sendToServerStub(data);
   }
+
+  showOLED("Gateway " + String(GATEWAY_ID),
+           "Relay " + String(currentRelayId),
+           "Received " + String(forwardCount),
+           "Ch " + String(currentChannelId));
 }
 
-void updateWaitingOLED(){
-  String stateLine =
-     (currentState == WAIT_RELAY1_DATA)? "WAIT RELAY1" : "WAIT RELAY2";
-  showOLED(stateLine, "Cycle: " + String(cycleId),
-           "R1 packets: " + String(relay1PacketCount),
-           "R2 packets: " + String(relay2PacketCount));
+void sendToServerStub(ForwardData data) {
+  Serial.print("[SERVER_STUB] relay=");
+  Serial.print(data.relayId);
+  Serial.print(", runner=");
+  Serial.print(data.runnerId);
+  Serial.println(" ready for HTTP/MQTT/WebSocket integration");
+}
+
+void changeState(GatewayState nextState) {
+  if (currentState == nextState) {
+    return;
+  }
+  Serial.print("[STATE] ");
+  Serial.print(stateName(currentState));
+  Serial.print(" -> ");
+  Serial.println(stateName(nextState));
+  currentState = nextState;
+  stateStartTime = millis();
+}
+
+const char *stateName(GatewayState state) {
+  switch (state) {
+    case WAIT_FORWARD_START:
+      return "WAIT_FORWARD_START";
+    case RECEIVE_FORWARD_DATA:
+      return "RECEIVE_FORWARD_DATA";
+    case WAIT_FORWARD_DONE:
+      return "WAIT_FORWARD_DONE";
+    case PRINT_OR_SEND_TO_SERVER:
+      return "PRINT_OR_SEND_TO_SERVER";
+  }
+  return "UNKNOWN";
 }
