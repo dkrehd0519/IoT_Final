@@ -340,11 +340,12 @@ slot 1~6을 사용해 `HANDOVER_JOIN`을 순차 수신한다.
 ### Expected Flow
 
 ```text
-Runner 1 and Runner 2 send handover_request=1 in the same cycle
+Runner 1 and Runner 2 send handover_request=1 from Relay 1
+after their accumulated GPS distance reaches 100m
 Relay 1 receives multiple handover requests
-Relay 1 approves up to 6 earliest requests in one cycle
+Relay 1 can approve up to 6 earliest requests in one cycle
 Relay 1 sends HANDOVER_ACK to Runner 1
-Relay 1 sends HANDOVER_ACK to Runner 2 if target capacity remains
+Relay 1 sends HANDOVER_ACK to Runner 2 because target capacity remains
 Runner 1 and Runner 2 switch to Channel 7 in this 2 Relay demo
 Runner 1 sends HANDOVER_JOIN in Relay 2 reserve slot 1 on the next valid cycle
 Runner 2 sends HANDOVER_JOIN in Relay 2 reserve slot 2 on the next valid cycle
@@ -353,6 +354,17 @@ Relay 1 removes Runner 1 and Runner 2 from activeRunnerList at cycle update
 Final Relay 1 activeRunnerList: Runner 3
 Final Relay 2 activeRunnerList: Runner 1, Runner 2
 ```
+
+Scenario 2의 handover request 기준은 Runner 코드의 아래 값이다.
+
+```cpp
+#define HANDOVER_REQUEST_DISTANCE_M 100.0f
+```
+
+GPS 이동거리 누적값 `totalDistanceM`이 100m 이상이 되면 Runner 1, Runner 2가
+handover request를 보낸다. GPS fix가 없고 `TEST_MODE` dummy 좌표만 사용하는 경우
+거리 누적이 자동으로 늘지 않으므로, 실제 이동 테스트 또는 별도 거리 시뮬레이션이
+필요하다.
 
 ### Scenario 2 Timetable
 
@@ -515,7 +527,7 @@ Relay당 60명 이상: cycle 지연 증가
 Relay당 100명 이상: wave 또는 slot 재설계 필요
 ```
 
-추천 정책:
+실서비스 확장 시 추천 정책:
 
 ```text
 WAVE_ENABLE_THRESHOLD_TOTAL_RUNNERS = 300
@@ -533,6 +545,9 @@ HANDOVER_FALLBACK_TIME_SEC = 30 * 60
 때까지 handover를 막는 방식은 피하고, wave별 handover window와 Relay별 승인 quota로
 부하를 제어하는 것이 좋다.
 
+현재 Scenario 2 데모 코드는 짧은 테스트를 위해 `HANDOVER_REQUEST_DISTANCE_M`을
+100m로 낮춰둔 상태이다.
+
 ## Quick Upload Checklist
 
 1. 업로드할 파일을 연다: `runner/runner.ino`, `relay/relay.ino`, `gateway/gateway.ino`
@@ -543,3 +558,22 @@ HANDOVER_FALLBACK_TIME_SEC = 30 * 60
 6. Serial Monitor baud rate는 `115200`으로 연다.
 7. Relay Serial에서 `Active Runner List`, `SLOT_TABLE`, `Forwarded Packet Count`를 확인한다.
 8. Gateway Serial에서 `Gateway Received Data` 또는 `EMERGENCY ALERT`를 확인한다.
+
+## Serial Monitor Demo Mode
+
+시연 영상 촬영을 위해 기본 Serial Monitor 출력은 핵심 이벤트 위주로 한국어로 표시한다.
+원문 packet이나 상태 전환 로그가 필요하면 각 `.ino` 파일 상단의 값을 `true`로 바꾼다.
+
+```cpp
+#define SHOW_RAW_PACKETS false
+#define SHOW_STATE_LOG false
+#define SHOW_DEBUG_LOG false
+```
+
+기본값 `false`에서는 다음 정보만 주로 보인다.
+
+```text
+Relay: Cycle 시작, active runner list, slot 배정표, Runner 상태 수신, handover 승인, Gateway 전달 개수
+Runner: slot 배정, 상태 전송, handover 승인/JOIN, 긴급 전송
+Gateway: 수신 시작, Runner 데이터, cycle 요약, 긴급 상황 알림
+```

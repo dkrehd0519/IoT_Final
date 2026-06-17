@@ -19,9 +19,12 @@
 // 데모 실행 시 Relay 장치마다 아래 값을 변경한다.
 #define DEMO_SCENARIO 1
 #define RELAY_ID 1
-#define SECTION_ID 2
+#define SECTION_ID 1
 #define CHANNEL_ID 2
 #define TEST_MODE true
+#define SHOW_RAW_PACKETS false
+#define SHOW_STATE_LOG false
+#define SHOW_DEBUG_LOG false
 
 #define LORA_FREQUENCY 915E6
 #define LORA_SYNC_WORD 0x33
@@ -168,13 +171,13 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" TTGO LoRa32 Marathon Relay Demo");
+  Serial.println(" 마라톤 Relay 노드 시작");
   Serial.println("========================================");
-  Serial.print("[CONFIG] DEMO_SCENARIO=");
+  Serial.print("데모 시나리오: ");
   Serial.println(DEMO_SCENARIO);
-  Serial.print("[CONFIG] RELAY_ID=");
+  Serial.print("Relay ID: ");
   Serial.println(RELAY_ID);
-  Serial.println("[CONFIG] LoRa/OLED pin and LoRa settings kept from tested code");
+  Serial.println("통신 설정: 기존 테스트 완료 설정 유지");
 
   Wire.begin(OLED_SDA, OLED_SCL);
   oledReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
@@ -190,13 +193,13 @@ void setup() {
 
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
   long freq = getFrequencyByChannel(currentChannelId);
-  Serial.print("[CHANNEL] logical=");
+  Serial.print("사용 Channel: ");
   Serial.print(currentChannelId);
-  Serial.print(", freq=");
+  Serial.print(" / 주파수=");
   Serial.println(freq);
 
   if (!LoRa.begin(freq)) {
-    Serial.println("[ERROR] LoRa initialization failed. Check wiring and board pins.");
+    Serial.println("오류: LoRa 초기화 실패. 배선과 핀 설정을 확인하세요.");
     showOLED("LoRa ERROR", "Relay " + String(RELAY_ID), "Check pins");
     while (true) {
       delay(1000);
@@ -238,7 +241,9 @@ void loop() {
       } else if (startsWithPacket(message, "EMERGENCY")) {
         handleEmergency(message, rssi, snr);
       } else {
-        Serial.println("[RX] Ignored packet for Relay");
+        if (SHOW_DEBUG_LOG) {
+          Serial.println("무시: Relay 대상 packet이 아님");
+        }
       }
     }
   }
@@ -247,9 +252,9 @@ void loop() {
     case BUILD_SLOT_TABLE:
       clearCycleData();
       Serial.println();
-      Serial.print("[CYCLE] Relay ");
+      Serial.print("Relay ");
       Serial.print(RELAY_ID);
-      Serial.print(" starting cycle ");
+      Serial.print("번 새 Cycle 시작: ");
       Serial.println(cycleId);
       printActiveRunnerList("Active Runner List");
       printSlotTable();
@@ -257,6 +262,7 @@ void loop() {
       break;
 
     case SEND_SCHEDULE:
+      Serial.println("Schedule 전송: Runner들에게 slot 배정 알림");
       sendLoRaMessage(buildSchedulePacket());
       stateStartTime = millis();
       reservePhaseEndTime = stateStartTime + PHASE_GUARD_MS +
@@ -272,14 +278,14 @@ void loop() {
 
     case LISTEN_RESERVE_SLOTS:
       if ((long)(millis() - reservePhaseEndTime) >= 0) {
-        Serial.println("[PHASE] Reserve slot phase complete");
+        Serial.println("Reserve Slot 수신 단계 완료");
         changeState(LISTEN_REGULAR_SLOTS);
       }
       break;
 
     case LISTEN_REGULAR_SLOTS:
       if ((long)(millis() - regularPhaseEndTime) >= 0) {
-        Serial.println("[PHASE] Regular runner uplink phase complete");
+        Serial.println("Runner 상태 수신 단계 완료");
         changeState(PROCESS_HANDOVER);
       }
       break;
@@ -342,10 +348,12 @@ void sendLoRaMessage(String msg) {
   LoRa.beginPacket();
   LoRa.print(msg);
   if (LoRa.endPacket() == 1) {
-    Serial.print("[TX] ");
-    Serial.println(msg);
+    if (SHOW_RAW_PACKETS) {
+      Serial.print("송신 packet: ");
+      Serial.println(msg);
+    }
   } else {
-    Serial.println("[TX][ERROR] LoRa transmission failed");
+    Serial.println("오류: LoRa 송신 실패");
   }
   LoRa.receive();
 }
@@ -364,13 +372,15 @@ bool receiveLoRaMessage(String &msg, int &rssi, float &snr) {
   rssi = LoRa.packetRssi();
   snr = LoRa.packetSnr();
 
-  Serial.print("[RX] ");
-  Serial.print(msg);
-  Serial.print(" | RSSI=");
-  Serial.print(rssi);
-  Serial.print(" dBm, SNR=");
-  Serial.print(snr, 2);
-  Serial.println(" dB");
+  if (SHOW_RAW_PACKETS) {
+    Serial.print("수신 packet: ");
+    Serial.print(msg);
+    Serial.print(" | RSSI=");
+    Serial.print(rssi);
+    Serial.print(" dBm, SNR=");
+    Serial.print(snr, 2);
+    Serial.println(" dB");
+  }
   return true;
 }
 
@@ -488,11 +498,10 @@ void clearCycleData() {
 }
 
 void printActiveRunnerList(String label) {
-  Serial.print("[ACTIVE] ");
   Serial.print(label);
   Serial.print(": ");
   if (activeRunnerCount == 0) {
-    Serial.println("empty");
+    Serial.println("없음");
     return;
   }
   for (int i = 0; i < activeRunnerCount; i++) {
@@ -506,23 +515,23 @@ void printActiveRunnerList(String label) {
 }
 
 void printSlotTable() {
-  Serial.println("[SLOT_TABLE] Regular slots");
+  Serial.println("Slot 배정표");
   if (activeRunnerCount == 0) {
-    Serial.println("  no active runners");
+    Serial.println("  배정된 Runner 없음");
   }
   for (int i = 0; i < activeRunnerCount; i++) {
-    Serial.print("  Regular Slot ");
+    Serial.print("  일반 Slot ");
     Serial.print(i + 1);
     Serial.print(" -> Runner ");
     Serial.println(activeRunners[i]);
   }
 
   if (reserveSlotCount > 0) {
-    Serial.println("[SLOT_TABLE] Handover reserve slots");
+    Serial.println("Handover Reserve Slot");
     for (int i = 0; i < reserveSlotCount; i++) {
       Serial.print("  Reserve Slot ");
       Serial.print(i + 1);
-      Serial.print(" -> source Relay ");
+      Serial.print(" -> 출발 Relay ");
       Serial.println(i + 1);
     }
   }
@@ -542,11 +551,11 @@ void addActiveRunner(int runnerId) {
     return;
   }
   if (activeRunnerCount >= MAX_ACTIVE_RUNNERS) {
-    Serial.println("[ACTIVE][WARN] activeRunnerList full");
+    Serial.println("경고: activeRunnerList가 가득 찼습니다.");
     return;
   }
   activeRunners[activeRunnerCount++] = runnerId;
-  Serial.print("[ACTIVE_ADD] Target relay activeRunnerList updated: Runner ");
+  Serial.print("Target Relay active list 추가: Runner ");
   Serial.println(runnerId);
 }
 
@@ -558,7 +567,7 @@ void removeActiveRunner(int runnerId) {
       }
       activeRunnerCount--;
       activeRunners[activeRunnerCount] = -1;
-      Serial.print("[ACTIVE_REMOVE] Source relay activeRunnerList updated: Runner ");
+      Serial.print("Source Relay active list 제거: Runner ");
       Serial.println(runnerId);
       return;
     }
@@ -615,29 +624,29 @@ void handleRunnerStatus(String msg, int rssi, float snr) {
   unsigned long requestTime = (unsigned long)getField(msg, 11).toInt();
 
   if (packetCycleId != (int)cycleId) {
-    Serial.println("[RUNNER_STATUS] Dropped: cycle mismatch");
+    if (SHOW_DEBUG_LOG) Serial.println("무시: cycle 불일치");
     return;
   }
   if (targetRelayId != RELAY_ID) {
-    Serial.println("[RUNNER_STATUS] Dropped: target relay mismatch");
+    if (SHOW_DEBUG_LOG) Serial.println("무시: target Relay 불일치");
     return;
   }
   if (!containsActiveRunner(runnerId)) {
-    Serial.println("[RUNNER_STATUS] Dropped: runner is not in activeRunnerList");
+    if (SHOW_DEBUG_LOG) Serial.println("무시: active list에 없는 Runner");
     return;
   }
 
-  Serial.println("[RUNNER_STATUS] Received Runner Packet");
-  Serial.print("  runner_id=");
+  Serial.println("Runner 상태 수신");
+  Serial.print("  Runner ID: ");
   Serial.println(runnerId);
-  Serial.print("  handover_request=");
+  Serial.print("  Handover 요청: ");
   Serial.println(handoverRequest);
 
   addRunnerDataToBuffer(packetCycleId, runnerId, lat, lng, pace, battery,
                         runnerSeq, gpsValid, rssi, snr);
 
   if (handoverRequest == 1) {
-    Serial.print("[HANDOVER] Handover request received from Runner ");
+    Serial.print("Handover 요청 수신: Runner ");
     Serial.println(runnerId);
     addHandoverRequest(runnerId, requestTime);
   }
@@ -659,14 +668,14 @@ void handleHandoverJoin(String msg) {
     return;
   }
 
-  Serial.println("[HANDOVER_JOIN] received");
-  Serial.print("  cycle_id=");
+  Serial.println("Handover JOIN 수신");
+  Serial.print("  Cycle: ");
   Serial.println(packetCycleId);
-  Serial.print("  runner_id=");
+  Serial.print("  Runner ID: ");
   Serial.println(runnerId);
-  Serial.print("  source_relay_id=");
+  Serial.print("  출발 Relay: ");
   Serial.println(sourceRelayId);
-  Serial.print("  target_relay_id=");
+  Serial.print("  도착 Relay: ");
   Serial.println(targetRelayId);
   addPendingAdd(runnerId);
 }
@@ -684,7 +693,7 @@ void handleEmergency(String msg, int rssi, float snr) {
   String timestamp = getField(msg, 6);
   int gpsValid = getField(msg, 7).toInt();
 
-  Serial.println("[EMERGENCY] Emergency packet received. Forwarding to Emergency Gateway.");
+  Serial.println("긴급 packet 수신: Emergency Gateway로 전달");
 
   String forward = "EMERGENCY_FORWARD,";
   forward += String(emergencyId);
@@ -713,7 +722,7 @@ void addRunnerDataToBuffer(int cycle, int runnerId, String lat, String lng,
                            int pace, int battery, unsigned long runnerSeq,
                            int gpsValid, int rssi, float snr) {
   if (bufferCount >= MAX_BUFFER_SIZE) {
-    Serial.println("[BUFFER][WARN] Buffer full");
+    Serial.println("경고: Relay buffer가 가득 찼습니다.");
     return;
   }
 
@@ -729,7 +738,7 @@ void addRunnerDataToBuffer(int cycle, int runnerId, String lat, String lng,
   data.rssi = rssi;
   data.snr = snr;
 
-  Serial.print("[BUFFER] Stored runner packet. count=");
+  Serial.print("Relay buffer 저장 완료: ");
   Serial.println(bufferCount);
 }
 
@@ -745,12 +754,12 @@ void addHandoverRequest(int runnerId, unsigned long requestTime) {
 
 void processHandoverRequests() {
   if (handoverRequestCount == 0) {
-    Serial.println("[HANDOVER] No handover requests");
+    Serial.println("Handover 요청 없음");
     return;
   }
 
   if (handoverRequestCount > 1) {
-    Serial.println("[HANDOVER] Multiple handover requests detected");
+    Serial.println("여러 Handover 요청 감지");
   }
 
   for (int i = 0; i < handoverRequestCount - 1; i++) {
@@ -770,18 +779,18 @@ void processHandoverRequests() {
       int nextChannelId = getNextHandoverChannelId(nextRelayId);
       int reserveSlotId = DEMO_VIRTUAL_TARGET_GROUP ? (i + 1) : RELAY_ID;
       approvedRunnerId = runnerId;
-      Serial.print("[HANDOVER] Approved runner ");
+      Serial.print("Handover 승인: Runner ");
       Serial.print(runnerId);
-      Serial.print(" -> virtual target relay ");
+      Serial.print(" -> 도착 Relay ");
       Serial.print(nextRelayId);
-      Serial.print(", channel ");
+      Serial.print(", Channel ");
       Serial.print(nextChannelId);
-      Serial.print(", reserve_slot ");
+      Serial.print(", Reserve Slot ");
       Serial.println(reserveSlotId);
       prepareAckForRunner(runnerId, nextRelayId, nextChannelId, reserveSlotId);
       addPendingRemove(runnerId);
     } else {
-      Serial.print("[HANDOVER] Retry runner ");
+      Serial.print("Handover 재시도 요청: Runner ");
       Serial.println(runnerId);
       prepareRetryForRunner(runnerId);
     }
@@ -863,9 +872,9 @@ void sendNextHandoverResponseIfNeeded() {
 
   String msg = responsePackets[responseCursor].message;
   if (startsWithPacket(msg, "HANDOVER_ACK")) {
-    Serial.println("[HANDOVER_ACK] sent");
+    Serial.println("HANDOVER_ACK 전송");
   } else if (startsWithPacket(msg, "HANDOVER_RETRY")) {
-    Serial.println("[HANDOVER_RETRY] sent");
+    Serial.println("HANDOVER_RETRY 전송");
   }
   sendLoRaMessage(msg);
   responseCursor++;
@@ -927,7 +936,7 @@ void forwardBufferedPacketsToGateway() {
   done += String(bufferCount);
   sendLoRaMessage(done);
 
-  Serial.print("[FORWARD] Forwarded Packet Count=");
+  Serial.print("Gateway 전달 완료: ");
   Serial.println(bufferCount);
   showOLED("Relay " + String(RELAY_ID),
            "Cycle " + String(cycleId),
@@ -939,10 +948,12 @@ void changeState(RelayState nextState) {
   if (currentState == nextState) {
     return;
   }
-  Serial.print("[STATE] ");
-  Serial.print(stateName(currentState));
-  Serial.print(" -> ");
-  Serial.println(stateName(nextState));
+  if (SHOW_STATE_LOG) {
+    Serial.print("상태 변경: ");
+    Serial.print(stateName(currentState));
+    Serial.print(" -> ");
+    Serial.println(stateName(nextState));
+  }
   currentState = nextState;
   stateStartTime = millis();
 }

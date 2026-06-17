@@ -20,6 +20,9 @@
 #define DEMO_SCENARIO 1
 #define GATEWAY_ID 1
 #define CHANNEL_ID 1
+#define SHOW_RAW_PACKETS false
+#define SHOW_STATE_LOG false
+#define SHOW_DEBUG_LOG false
 
 #define LORA_FREQUENCY 915E6
 #define LORA_SYNC_WORD 0x33
@@ -97,13 +100,13 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" TTGO LoRa32 Marathon Gateway Demo");
+  Serial.println(" 마라톤 Gateway 노드 시작");
   Serial.println("========================================");
-  Serial.print("[CONFIG] DEMO_SCENARIO=");
+  Serial.print("데모 시나리오: ");
   Serial.println(DEMO_SCENARIO);
-  Serial.print("[CONFIG] GATEWAY_ID=");
+  Serial.print("Gateway ID: ");
   Serial.println(GATEWAY_ID);
-  Serial.println("[CONFIG] LoRa/OLED pin and LoRa settings kept from tested code");
+  Serial.println("통신 설정: 기존 테스트 완료 설정 유지");
 
   Wire.begin(OLED_SDA, OLED_SCL);
   oledReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
@@ -117,13 +120,13 @@ void setup() {
 
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
   long freq = getFrequencyByChannel(currentChannelId);
-  Serial.print("[CHANNEL] logical=");
+  Serial.print("사용 Channel: ");
   Serial.print(currentChannelId);
-  Serial.print(", freq=");
+  Serial.print(" / 주파수=");
   Serial.println(freq);
 
   if (!LoRa.begin(freq)) {
-    Serial.println("[ERROR] LoRa initialization failed. Check wiring and board pins.");
+    Serial.println("오류: LoRa 초기화 실패. 배선과 핀 설정을 확인하세요.");
     showOLED("LoRa ERROR", "Gateway " + String(GATEWAY_ID), "Check pins");
     while (true) {
       delay(1000);
@@ -161,13 +164,15 @@ void loop() {
     } else if (startsWithPacket(message, "EMERGENCY_FORWARD")) {
       handleEmergencyForward(message);
     } else {
-      Serial.println("[RX] Ignored packet for Gateway");
+      if (SHOW_DEBUG_LOG) {
+        Serial.println("무시: Gateway 대상 packet이 아님");
+      }
     }
   }
 
   if ((currentState == RECEIVE_FORWARD_DATA || currentState == WAIT_FORWARD_DONE) &&
       (unsigned long)(millis() - stateStartTime) >= FORWARD_TIMEOUT_MS) {
-    Serial.println("[GATEWAY][TIMEOUT] Forwarding sequence timed out. Reset to WAIT_FORWARD_START.");
+    Serial.println("Gateway 수신 시간 초과: 다음 전달 대기");
     changeState(WAIT_FORWARD_START);
   }
 
@@ -204,13 +209,15 @@ bool receiveLoRaMessage(String &msg, int &rssi, float &snr) {
   rssi = LoRa.packetRssi();
   snr = LoRa.packetSnr();
 
-  Serial.print("[RX] ");
-  Serial.print(msg);
-  Serial.print(" | Gateway RSSI=");
-  Serial.print(rssi);
-  Serial.print(" dBm, SNR=");
-  Serial.print(snr, 2);
-  Serial.println(" dB");
+  if (SHOW_RAW_PACKETS) {
+    Serial.print("수신 packet: ");
+    Serial.print(msg);
+    Serial.print(" | Gateway RSSI=");
+    Serial.print(rssi);
+    Serial.print(" dBm, SNR=");
+    Serial.print(snr, 2);
+    Serial.println(" dB");
+  }
   return true;
 }
 
@@ -284,12 +291,13 @@ void handleForwardStart(String msg) {
   forwardCount = 0;
 
   Serial.println();
-  Serial.println("[FORWARD_START] Gateway forwarding session started");
-  Serial.print("  cycle_id=");
+  Serial.println();
+  Serial.println("========== Gateway 수신 시작 ==========");
+  Serial.print("Cycle: ");
   Serial.println(currentCycleId);
-  Serial.print("  relay_id=");
+  Serial.print("Relay: ");
   Serial.println(currentRelayId);
-  Serial.print("  expected_count=");
+  Serial.print("예상 Runner 수: ");
   Serial.println(expectedForwardCount);
 
   showOLED("Forward Start",
@@ -301,14 +309,14 @@ void handleForwardStart(String msg) {
 
 void handleForwardData(String msg, int relayRssi, float relaySnr) {
   if (forwardCount >= MAX_FORWARD_DATA) {
-    Serial.println("[FORWARD_DATA][WARN] Gateway buffer full");
+    Serial.println("경고: Gateway buffer가 가득 찼습니다.");
     return;
   }
 
   int packetCycleId = getField(msg, 1).toInt();
   int relayId = getField(msg, 2).toInt();
   if (packetCycleId != currentCycleId || relayId != currentRelayId) {
-    Serial.println("[FORWARD_DATA] Ignored: cycle or relay mismatch");
+    if (SHOW_DEBUG_LOG) Serial.println("무시: cycle 또는 relay 불일치");
     return;
   }
 
@@ -325,26 +333,26 @@ void handleForwardData(String msg, int relayRssi, float relaySnr) {
   data.runnerRssi = getField(msg, 10).toInt();
   data.runnerSnr = getField(msg, 11).toFloat();
 
-  Serial.println("[FORWARD_DATA] Gateway Received Data");
-  Serial.print("  relay_id=");
+  Serial.println("Runner 데이터 수신");
+  Serial.print("  Relay ID: ");
   Serial.println(data.relayId);
-  Serial.print("  runner_id=");
+  Serial.print("  Runner ID: ");
   Serial.println(data.runnerId);
-  Serial.print("  lat/lng=");
+  Serial.print("  위치: ");
   Serial.print(data.lat);
   Serial.print(", ");
   Serial.println(data.lng);
-  Serial.print("  pace/battery/seq=");
+  Serial.print("  Pace / Battery / Seq: ");
   Serial.print(data.pace);
   Serial.print(" / ");
   Serial.print(data.battery);
   Serial.print(" / ");
   Serial.println(data.seq);
-  Serial.print("  runner_rssi/snr=");
+  Serial.print("  Runner->Relay RSSI/SNR: ");
   Serial.print(data.runnerRssi);
   Serial.print(" / ");
   Serial.println(data.runnerSnr, 2);
-  Serial.print("  relay_to_gateway_rssi/snr=");
+  Serial.print("  Relay->Gateway RSSI/SNR: ");
   Serial.print(relayRssi);
   Serial.print(" / ");
   Serial.println(relaySnr, 2);
@@ -358,17 +366,17 @@ void handleForwardDone(String msg) {
   int reportedCount = getField(msg, 3).toInt();
 
   if (packetCycleId != currentCycleId || relayId != currentRelayId) {
-    Serial.println("[FORWARD_DONE] Ignored: cycle or relay mismatch");
+    if (SHOW_DEBUG_LOG) Serial.println("무시: cycle 또는 relay 불일치");
     return;
   }
 
-  Serial.println("[FORWARD_DONE] Gateway forwarding session complete");
-  Serial.print("  reported_count=");
+  Serial.println("Gateway 수신 완료");
+  Serial.print("  Relay 보고 개수: ");
   Serial.println(reportedCount);
-  Serial.print("  received_count=");
+  Serial.print("  Gateway 수신 개수: ");
   Serial.println(forwardCount);
   if (reportedCount != forwardCount) {
-    Serial.println("[FORWARD_DONE][WARN] reported_count differs from received_count");
+    Serial.println("경고: Relay 보고 개수와 Gateway 수신 개수가 다릅니다.");
   }
 
   changeState(PRINT_OR_SEND_TO_SERVER);
@@ -391,28 +399,28 @@ void handleEmergencyForward(String msg) {
   float snr = getField(msg, 10).toFloat();
 
   Serial.println();
-  Serial.println("========== EMERGENCY ALERT ==========");
-  Serial.print("Emergency ID: ");
+  Serial.println("========== 긴급 상황 발생 ==========");
+  Serial.print("긴급 ID: ");
   Serial.println(emergencyId);
   Serial.print("Runner ID: ");
   Serial.println(runnerId);
   Serial.print("Relay ID: ");
   Serial.println(relayId);
-  Serial.print("Latitude: ");
+  Serial.print("위도: ");
   Serial.println(lat);
-  Serial.print("Longitude: ");
+  Serial.print("경도: ");
   Serial.println(lng);
-  Serial.print("Battery: ");
+  Serial.print("배터리: ");
   Serial.println(battery);
-  Serial.print("Timestamp: ");
+  Serial.print("시간: ");
   Serial.println(timestamp);
-  Serial.print("GPS Valid: ");
+  Serial.print("GPS 유효: ");
   Serial.println(gpsValid);
   Serial.print("RSSI: ");
   Serial.println(rssi);
   Serial.print("SNR: ");
   Serial.println(snr, 2);
-  Serial.println("=====================================");
+  Serial.println("===================================");
 
   showOLED("!!! EMERGENCY !!!",
            "Runner " + String(runnerId),
@@ -422,25 +430,25 @@ void handleEmergencyForward(String msg) {
 
 void printAndSendCycleData() {
   Serial.println();
-  Serial.println("[CYCLE_RESULT] Gateway Received Data Summary");
-  Serial.print("  cycle_id=");
+  Serial.println("========== Cycle 수신 요약 ==========");
+  Serial.print("Cycle: ");
   Serial.println(currentCycleId);
-  Serial.print("  relay_id=");
+  Serial.print("Relay: ");
   Serial.println(currentRelayId);
-  Serial.print("  received_count=");
+  Serial.print("수신 Runner 수: ");
   Serial.println(forwardCount);
 
   for (int i = 0; i < forwardCount; i++) {
     ForwardData &data = forwardBuffer[i];
     Serial.print("  Runner ");
     Serial.print(data.runnerId);
-    Serial.print(" -> lat=");
+    Serial.print(" -> 위도=");
     Serial.print(data.lat);
-    Serial.print(", lng=");
+    Serial.print(", 경도=");
     Serial.print(data.lng);
-    Serial.print(", pace=");
+    Serial.print(", Pace=");
     Serial.print(data.pace);
-    Serial.print(", battery=");
+    Serial.print(", 배터리=");
     Serial.println(data.battery);
     sendToServerStub(data);
   }
@@ -452,21 +460,24 @@ void printAndSendCycleData() {
 }
 
 void sendToServerStub(ForwardData data) {
-  Serial.print("[SERVER_STUB] relay=");
-  Serial.print(data.relayId);
-  Serial.print(", runner=");
-  Serial.print(data.runnerId);
-  Serial.println(" ready for HTTP/MQTT/WebSocket integration");
+  if (SHOW_DEBUG_LOG) {
+    Serial.print("서버 전송 준비: relay=");
+    Serial.print(data.relayId);
+    Serial.print(", runner=");
+    Serial.println(data.runnerId);
+  }
 }
 
 void changeState(GatewayState nextState) {
   if (currentState == nextState) {
     return;
   }
-  Serial.print("[STATE] ");
-  Serial.print(stateName(currentState));
-  Serial.print(" -> ");
-  Serial.println(stateName(nextState));
+  if (SHOW_STATE_LOG) {
+    Serial.print("상태 변경: ");
+    Serial.print(stateName(currentState));
+    Serial.print(" -> ");
+    Serial.println(stateName(nextState));
+  }
   currentState = nextState;
   stateStartTime = millis();
 }

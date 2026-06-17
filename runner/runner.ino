@@ -23,6 +23,9 @@ SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 #define RUNNER_ID 1
 #define DEMO_SCENARIO 1
 #define TEST_MODE true
+#define SHOW_RAW_PACKETS false
+#define SHOW_STATE_LOG false
+#define SHOW_DEBUG_LOG false
 
 #define LORA_FREQUENCY 915.0
 #define LORA_SYNC_WORD 0x33
@@ -45,6 +48,7 @@ const float CHANNEL_FREQ_MHZ[] = {
 #define DEMO_SLOT_DURATION_MS 900UL
 #define PHASE_GUARD_MS 250UL
 #define RESPONSE_WINDOW_MS 5000UL
+#define HANDOVER_REQUEST_DISTANCE_M 100.0f
 #define EMERGENCY_TX_TOTAL_COUNT 3
 #define EMERGENCY_RETRY_INTERVAL_MS 650UL
 #define EMERGENCY_BACKOFF_MAX_MS 150UL
@@ -161,13 +165,13 @@ void setup() {
 
   Serial.println();
   Serial.println("========================================");
-  Serial.println(" TTGO T-Beam SX1262 Marathon Runner Demo");
+  Serial.println(" 마라톤 Runner 노드 시작");
   Serial.println("========================================");
-  Serial.print("[CONFIG] RUNNER_ID=");
+  Serial.print("러너 ID: ");
   Serial.println(RUNNER_ID);
-  Serial.print("[CONFIG] DEMO_SCENARIO=");
+  Serial.print("데모 시나리오: ");
   Serial.println(DEMO_SCENARIO);
-  Serial.println("[CONFIG] RadioLib/SX1262 pin and LoRa settings kept from tested code");
+  Serial.println("통신 설정: 기존 테스트 완료 설정 유지");
 
   pinMode(SOS_BUTTON_PIN, INPUT);
   GPSserial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
@@ -184,7 +188,7 @@ void setup() {
       LORA_PREAMBLE_LENGTH);
 
   if (state != RADIOLIB_ERR_NONE) {
-    Serial.print("[ERROR] RadioLib SX1262 initialization failed, code=");
+    Serial.print("오류: LoRa 초기화 실패, code=");
     Serial.println(state);
     while (true) {
       delay(1000);
@@ -200,12 +204,12 @@ void setup() {
 
   state = radio.startReceive();
   if (state == RADIOLIB_ERR_NONE) {
-    Serial.println("[LoRa] Receive mode started");
+    Serial.println("LoRa 수신 대기 시작");
   }
 
-  Serial.print("[DEMO] Initial relay=");
+  Serial.print("초기 배정 Relay: ");
   Serial.print(currentRelayId);
-  Serial.print(", channel=");
+  Serial.print(" / Channel: ");
   Serial.println(currentChannelId);
   changeState(WAIT_SCHEDULE);
 }
@@ -218,7 +222,7 @@ void loop() {
       !scenario3EmergencyTriggered &&
       (unsigned long)(millis() - bootMillis) > 12000UL) {
     scenario3EmergencyTriggered = true;
-    Serial.println("[TEST] Scenario 3 emergency trigger fired");
+    Serial.println("테스트: 자동 긴급 상황 발생");
     triggerEmergencyEvent();
   }
 
@@ -235,7 +239,9 @@ void loop() {
     } else if (startsWithPacket(message, "HANDOVER_RETRY")) {
       handleHandoverRetry(message);
     } else {
-      Serial.println("[RX] Ignored packet for Runner");
+      if (SHOW_DEBUG_LOG) {
+        Serial.println("무시: Runner 대상 packet이 아님");
+      }
     }
   }
 
@@ -261,7 +267,7 @@ void loop() {
 
     case WAIT_HANDOVER_RESPONSE:
       if ((long)(millis() - responseDeadline) >= 0) {
-        Serial.println("[HANDOVER] Response timeout. Will retry on next assigned schedule.");
+        Serial.println("Handover 응답 시간 초과: 다음 cycle에서 재시도");
         retryHandoverNextCycle = true;
         changeState(WAIT_SCHEDULE);
       }
@@ -288,14 +294,18 @@ void loop() {
 }
 
 void sendLoRaMessage(String msg) {
-  Serial.print("[TX] ");
-  Serial.println(msg);
+  if (SHOW_RAW_PACKETS) {
+    Serial.print("송신 packet: ");
+    Serial.println(msg);
+  }
   radio.standby();
   int state = radio.transmit(msg);
   if (state == RADIOLIB_ERR_NONE) {
-    Serial.println("[TX] Success");
+    if (SHOW_RAW_PACKETS) {
+      Serial.println("송신 성공");
+    }
   } else {
-    Serial.print("[TX][ERROR] RadioLib transmit failed, code=");
+    Serial.print("오류: LoRa 송신 실패, code=");
     Serial.println(state);
   }
   receivedFlag = false;
@@ -310,7 +320,7 @@ bool receiveLoRaMessage(String &msg, int &rssi, float &snr) {
   receivedFlag = false;
   int state = radio.readData(msg);
   if (state != RADIOLIB_ERR_NONE) {
-    Serial.print("[RX][ERROR] readData failed, code=");
+    Serial.print("오류: LoRa 수신 데이터 읽기 실패, code=");
     Serial.println(state);
     radio.startReceive();
     return false;
@@ -320,13 +330,15 @@ bool receiveLoRaMessage(String &msg, int &rssi, float &snr) {
   rssi = (int)radio.getRSSI();
   snr = radio.getSNR();
 
-  Serial.print("[RX] ");
-  Serial.print(msg);
-  Serial.print(" | RSSI=");
-  Serial.print(rssi);
-  Serial.print(" dBm, SNR=");
-  Serial.print(snr, 2);
-  Serial.println(" dB");
+  if (SHOW_RAW_PACKETS) {
+    Serial.print("수신 packet: ");
+    Serial.print(msg);
+    Serial.print(" | RSSI=");
+    Serial.print(rssi);
+    Serial.print(" dBm, SNR=");
+    Serial.print(snr, 2);
+    Serial.println(" dB");
+  }
 
   radio.startReceive();
   return true;
@@ -432,7 +444,7 @@ void triggerEmergencyEvent() {
   emergencySeq++;
   savedChannelBeforeEmergency = currentChannelId;
   nextEmergencyTxTime = millis() + random(0, EMERGENCY_BACKOFF_MAX_MS);
-  Serial.print("[EMERGENCY] Triggered. saved_channel=");
+  Serial.print("긴급 상황 발생: 현재 Channel 저장=");
   Serial.println(savedChannelBeforeEmergency);
 }
 
@@ -444,7 +456,7 @@ void handleEmergencyIfNeeded() {
   if (emergencyTxCount >= EMERGENCY_TX_TOTAL_COUNT) {
     emergencyPending = false;
     switchRunnerChannel(savedChannelBeforeEmergency);
-    Serial.println("[EMERGENCY] Burst complete. Returned to normal channel.");
+    Serial.println("긴급 전송 완료: 원래 Channel로 복귀");
     return;
   }
 
@@ -475,7 +487,7 @@ void sendEmergencyPacket() {
   message += ",";
   message += gpsValid ? "1" : "0";
 
-  Serial.print("[EMERGENCY][TX] count=");
+  Serial.print("긴급 packet 전송 ");
   Serial.print(emergencyTxCount + 1);
   Serial.print("/");
   Serial.println(EMERGENCY_TX_TOTAL_COUNT);
@@ -546,11 +558,13 @@ float getFrequencyByChannel(int channelId) {
 
 bool switchRunnerChannel(int channelId) {
   float freqMHz = getFrequencyByChannel(channelId);
-  Serial.print("[CHANNEL] Switch logical channel ");
-  Serial.print(channelId);
-  Serial.print(" -> ");
-  Serial.print(freqMHz, 2);
-  Serial.println(" MHz");
+  if (SHOW_DEBUG_LOG) {
+    Serial.print("Channel 변경: ");
+    Serial.print(channelId);
+    Serial.print(" -> ");
+    Serial.print(freqMHz, 2);
+    Serial.println(" MHz");
+  }
 
   radio.standby();
   int state = radio.setFrequency(freqMHz);
@@ -560,7 +574,7 @@ bool switchRunnerChannel(int channelId) {
     return true;
   }
 
-  Serial.print("[CHANNEL][ERROR] setFrequency failed, code=");
+    Serial.print("오류: Channel 변경 실패, code=");
   Serial.println(state);
   radio.startReceive();
   return false;
@@ -579,6 +593,9 @@ int getInitialChannelForRunner() {
 int getInitialRelayForRunner() {
   if (DEMO_SCENARIO == 1) {
     return (RUNNER_ID == 3) ? 2 : 1;
+  }
+  if (DEMO_SCENARIO == 2) {
+    return 1;
   }
   return 1;
 }
@@ -609,12 +626,18 @@ bool shouldRequestHandover() {
     return false;
   }
 
-  if (RUNNER_ID == 1) {
-    return true;
-  }
+  if (RUNNER_ID == 1 || RUNNER_ID == 2) {
+    if (totalDistanceM >= HANDOVER_REQUEST_DISTANCE_M) {
+      return true;
+    }
 
-  if (RUNNER_ID == 2) {
-    return retryHandoverNextCycle || activeCycleId >= 2;
+    if (SHOW_DEBUG_LOG) {
+      Serial.print("Handover 대기: 현재 이동거리 ");
+      Serial.print(totalDistanceM, 1);
+      Serial.print("m / 기준 ");
+      Serial.print(HANDOVER_REQUEST_DISTANCE_M, 1);
+      Serial.println("m");
+    }
   }
 
   return false;
@@ -642,7 +665,9 @@ void handleSchedule(String msg) {
   int parsedReserveSlots = getField(msg, 6).toInt();
 
   if (channelId != currentChannelId) {
-    Serial.println("[SCHEDULE] Ignored: schedule is for another logical channel");
+    if (SHOW_DEBUG_LOG) {
+      Serial.println("무시: 다른 Channel의 Schedule");
+    }
     return;
   }
 
@@ -659,9 +684,9 @@ void handleSchedule(String msg) {
     reserveSlotCount = parsedReserveSlots;
     sendTime = millis() + PHASE_GUARD_MS +
                (unsigned long)(reserveSlotId - 1) * (unsigned long)slotDurationMs;
-    Serial.print("[HANDOVER] Target schedule received. reserve_slot=");
+    Serial.print("Handover 대상 Relay Schedule 수신: reserve slot ");
     Serial.print(reserveSlotId);
-    Serial.print(", join at millis=");
+    Serial.print(" / JOIN 예정 시간=");
     Serial.println(sendTime);
     changeState(SEND_HANDOVER_JOIN);
     return;
@@ -669,9 +694,11 @@ void handleSchedule(String msg) {
 
   int slotIndex = -1;
   if (!scheduleContainsRunner(msg, slotIndex)) {
-    Serial.print("[SCHEDULE] Runner ");
+    if (SHOW_DEBUG_LOG) {
+      Serial.print("무시: Schedule에 Runner ");
     Serial.print(RUNNER_ID);
-    Serial.println(" not in activeRunnerList. Ignored.");
+      Serial.println("가 없음");
+    }
     return;
   }
 
@@ -684,14 +711,15 @@ void handleSchedule(String msg) {
              (unsigned long)reserveSlotCount * (unsigned long)slotDurationMs +
              (unsigned long)assignedSlotIndex * (unsigned long)slotDurationMs;
 
-  Serial.println("[SCHEDULE] Assigned regular slot");
-  Serial.print("  cycle_id=");
+  Serial.println();
+  Serial.println("========== Runner Slot 배정 ==========");
+  Serial.print("Cycle: ");
   Serial.println(activeCycleId);
-  Serial.print("  relay_id=");
+  Serial.print("Relay: ");
   Serial.println(currentRelayId);
-  Serial.print("  slot_index=");
+  Serial.print("내 Slot 번호: ");
   Serial.println(assignedSlotIndex);
-  Serial.print("  send_at_millis=");
+  Serial.print("전송 예정 시각(ms): ");
   Serial.println(sendTime);
   changeState(WAIT_MY_SLOT);
 }
@@ -723,9 +751,9 @@ void sendRunnerStatus() {
   message += ",";
   message += String(requestTime);
 
-  Serial.print("[RUNNER_STATUS] slot_index=");
+  Serial.print("Runner 상태 전송: slot ");
   Serial.print(assignedSlotIndex);
-  Serial.print(", handover_request=");
+  Serial.print(" / handover 요청=");
   Serial.println(requestHandover ? "1" : "0");
   sendLoRaMessage(message);
 }
@@ -745,16 +773,17 @@ void handleHandoverAck(String msg) {
   handoverPending = true;
   retryHandoverNextCycle = false;
 
-  Serial.println("[HANDOVER_ACK] Accepted");
-  Serial.print("  cycle_id=");
+  Serial.println();
+  Serial.println("========== Handover 승인 수신 ==========");
+  Serial.print("Cycle: ");
   Serial.println(cycleId);
-  Serial.print("  next_relay_id=");
+  Serial.print("다음 Relay: ");
   Serial.println(nextRelayId);
-  Serial.print("  next_channel=");
+  Serial.print("다음 Channel: ");
   Serial.println(nextChannelId);
-  Serial.print("  reserve_slot_id=");
+  Serial.print("Reserve Slot: ");
   Serial.println(reserveSlotId);
-  Serial.print("  valid_from_cycle=");
+  Serial.print("적용 Cycle: ");
   Serial.println(validFromCycle);
 
   switchRunnerChannel(nextChannelId);
@@ -769,7 +798,7 @@ void handleHandoverRetry(String msg) {
 
   int retryCycle = getField(msg, 3).toInt();
   retryHandoverNextCycle = true;
-  Serial.print("[HANDOVER_RETRY] retry_cycle=");
+  Serial.print("Handover 재시도 요청: retry cycle ");
   Serial.println(retryCycle);
   changeState(WAIT_SCHEDULE);
 }
@@ -786,7 +815,7 @@ void sendHandoverJoin() {
   message += ",";
   message += String(seq++);
 
-  Serial.print("[HANDOVER_JOIN] reserve_slot=");
+  Serial.print("Handover JOIN 전송: reserve slot ");
   Serial.println(reserveSlotId);
   sendLoRaMessage(message);
 }
@@ -795,10 +824,12 @@ void changeState(RunnerState nextState) {
   if (currentState == nextState) {
     return;
   }
-  Serial.print("[STATE] ");
-  Serial.print(stateName(currentState));
-  Serial.print(" -> ");
-  Serial.println(stateName(nextState));
+  if (SHOW_STATE_LOG) {
+    Serial.print("상태 변경: ");
+    Serial.print(stateName(currentState));
+    Serial.print(" -> ");
+    Serial.println(stateName(nextState));
+  }
   currentState = nextState;
 }
 
