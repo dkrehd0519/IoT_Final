@@ -3,6 +3,8 @@
 #include <LoRa.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
 
 // 기존 통신 테스트를 통과한 TTGO LoRa32-OLED 환경 설정은 유지한다.
 #define LORA_SS 18
@@ -18,8 +20,8 @@
 
 // 데모 실행 시 Gateway 장치마다 아래 값을 변경한다.
 #define DEMO_SCENARIO 1
-#define GATEWAY_ID 1
-#define CHANNEL_ID 1
+#define GATEWAY_ID 2
+#define CHANNEL_ID 2
 #define SHOW_RAW_PACKETS false
 #define SHOW_STATE_LOG false
 #define SHOW_DEBUG_LOG false
@@ -31,6 +33,14 @@
 #define LORA_BANDWIDTH 125E3
 #define LORA_CODING_RATE_DENOMINATOR 5
 #define LORA_PREAMBLE_LENGTH 8
+
+// WiFi / MQTT 설정
+#define WIFI_SSID "wifi_name"
+#define WIFI_PASSWORD "wifi_password"
+#define MQTT_BROKER "mqtt_host_ip"
+#define MQTT_PORT 1883
+#define MQTT_TOPIC_DATA "marathon/gateways/1/data"
+#define MQTT_TOPIC_EMERGENCY "marathon/gateways/1/emergency"
 
 // 기존에 검증한 실제 주파수 테이블은 유지하고, 데모 channel id만 논리적으로 매핑한다.
 const long CHANNEL_FREQ_HZ[] = {
@@ -46,6 +56,9 @@ const long CHANNEL_FREQ_HZ[] = {
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool oledReady = false;
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 
 enum GatewayState {
   WAIT_FORWARD_START,
@@ -66,6 +79,8 @@ struct ForwardData {
   int gpsValid;
   int runnerRssi;
   float runnerSnr;
+  int relayRssi;
+  float relaySnr;
 };
 
 GatewayState currentState = WAIT_FORWARD_START;
@@ -85,12 +100,17 @@ String getField(String msg, int index);
 long getFrequencyByChannel(int channelId);
 int getEffectiveChannelId();
 bool isEmergencyGateway();
+
+void connectWiFi();
+void connectMQTT();
+void mqttPublish(const char *topic, String msg);
+
 void handleForwardStart(String msg);
 void handleForwardData(String msg, int relayRssi, float relaySnr);
 void handleForwardDone(String msg);
 void handleEmergencyForward(String msg);
 void printAndSendCycleData();
-void sendToServerStub(ForwardData data);
+void sendToServer(ForwardData data);
 void changeState(GatewayState nextState);
 const char *stateName(GatewayState state);
 
@@ -110,6 +130,7 @@ void setup() {
 
   Wire.begin(OLED_SDA, OLED_SCL);
   oledReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS);
+
   if (oledReady) {
     display.clearDisplay();
     display.setTextSize(1);
@@ -119,6 +140,7 @@ void setup() {
   currentChannelId = getEffectiveChannelId();
 
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
   long freq = getFrequencyByChannel(currentChannelId);
   Serial.print("사용 Channel: ");
   Serial.print(currentChannelId);
@@ -128,6 +150,7 @@ void setup() {
   if (!LoRa.begin(freq)) {
     Serial.println("오류: LoRa 초기화 실패. 배선과 핀 설정을 확인하세요.");
     showOLED("LoRa ERROR", "Gateway " + String(GATEWAY_ID), "Check pins");
+
     while (true) {
       delay(1000);
     }
@@ -142,14 +165,28 @@ void setup() {
   LoRa.enableCrc();
   LoRa.receive();
 
+  connectWiFi();
+  connectMQTT();
+
   showOLED("Gateway " + String(GATEWAY_ID),
            "Scenario " + String(DEMO_SCENARIO),
            "Channel " + String(currentChannelId),
            isEmergencyGateway() ? "Emergency" : "Normal");
+
   changeState(WAIT_FORWARD_START);
 }
 
 void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (!mqttClient.connected()) {
+    connectMQTT();
+  }
+
+  mqttClient.loop();
+
   String message;
   int rssi = 0;
   float snr = 0.0;
@@ -182,10 +219,72 @@ void loop() {
   }
 }
 
+void connectWiFi() {
+  Serial.print("[WiFi] Connecting to ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("[WiFi] Connected. IP=");
+  Serial.println(WiFi.localIP());
+}
+
+void connectMQTT() {
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+
+  while (!mqttClient.connected()) {
+    String clientId = "marathon-gateway-" + String(GATEWAY_ID);
+
+    Serial.print("[MQTT] Connecting to ");
+    Serial.print(MQTT_BROKER);
+    Serial.print(":");
+    Serial.println(MQTT_PORT);
+
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("[MQTT] Connected");
+    } else {
+      Serial.print("[MQTT][ERROR] rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" retry in 2s");
+      delay(2000);
+    }
+  }
+}
+
+void mqttPublish(const char *topic, String msg) {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (!mqttClient.connected()) {
+    connectMQTT();
+  }
+
+  bool ok = mqttClient.publish(topic, msg.c_str());
+
+  if (ok) {
+    Serial.print("[MQTT][PUB] ");
+    Serial.print(topic);
+    Serial.print(" -> ");
+    Serial.println(msg);
+  } else {
+    Serial.print("[MQTT][ERROR] Publish failed -> ");
+    Serial.println(msg);
+  }
+}
+
 void showOLED(String line1, String line2, String line3, String line4) {
   if (!oledReady) {
     return;
   }
+
   display.clearDisplay();
   display.setCursor(0, 0);
   display.println(line1);
@@ -197,14 +296,17 @@ void showOLED(String line1, String line2, String line3, String line4) {
 
 bool receiveLoRaMessage(String &msg, int &rssi, float &snr) {
   int packetSize = LoRa.parsePacket();
+
   if (packetSize == 0) {
     return false;
   }
 
   msg = "";
+
   while (LoRa.available()) {
     msg += (char)LoRa.read();
   }
+
   msg.trim();
   rssi = LoRa.packetRssi();
   snr = LoRa.packetSnr();
@@ -218,12 +320,14 @@ bool receiveLoRaMessage(String &msg, int &rssi, float &snr) {
     Serial.print(snr, 2);
     Serial.println(" dB");
   }
+
   return true;
 }
 
 bool startsWithPacket(String msg, String type) {
   msg.trim();
   type.trim();
+
   return msg == type || msg.startsWith(type + ",");
 }
 
@@ -234,6 +338,7 @@ String getField(String msg, int index) {
 
   int fieldStart = 0;
   int currentIndex = 0;
+
   for (int i = 0; i <= msg.length(); i++) {
     if (i == msg.length() || msg.charAt(i) == ',') {
       if (currentIndex == index) {
@@ -241,15 +346,18 @@ String getField(String msg, int index) {
         field.trim();
         return field;
       }
+
       currentIndex++;
       fieldStart = i + 1;
     }
   }
+
   return "";
 }
 
 long getFrequencyByChannel(int channelId) {
   int index = 0;
+
   if (channelId == 1) {
     index = 0;
   } else if (channelId == 2) {
@@ -260,10 +368,12 @@ long getFrequencyByChannel(int channelId) {
     index = 3;
   } else {
     index = (channelId - 1) % 5;
+
     if (index < 0) {
       index = 0;
     }
   }
+
   return CHANNEL_FREQ_HZ[index];
 }
 
@@ -271,12 +381,15 @@ int getEffectiveChannelId() {
   if (DEMO_SCENARIO == 1) {
     return (GATEWAY_ID == 2) ? 2 : 1;
   }
+
   if (DEMO_SCENARIO == 2) {
     return (GATEWAY_ID == 2) ? 7 : 1;
   }
+
   if (DEMO_SCENARIO == 3) {
     return (GATEWAY_ID == 2) ? 13 : 1;
   }
+
   return CHANNEL_ID;
 }
 
@@ -304,6 +417,7 @@ void handleForwardStart(String msg) {
            "Relay " + String(currentRelayId),
            "Cycle " + String(currentCycleId),
            "Count " + String(expectedForwardCount));
+
   changeState(RECEIVE_FORWARD_DATA);
 }
 
@@ -315,12 +429,16 @@ void handleForwardData(String msg, int relayRssi, float relaySnr) {
 
   int packetCycleId = getField(msg, 1).toInt();
   int relayId = getField(msg, 2).toInt();
+
   if (packetCycleId != currentCycleId || relayId != currentRelayId) {
-    if (SHOW_DEBUG_LOG) Serial.println("무시: cycle 또는 relay 불일치");
+    if (SHOW_DEBUG_LOG) {
+      Serial.println("무시: cycle 또는 relay 불일치");
+    }
     return;
   }
 
   ForwardData &data = forwardBuffer[forwardCount++];
+
   data.cycleId = packetCycleId;
   data.relayId = relayId;
   data.runnerId = getField(msg, 3).toInt();
@@ -332,6 +450,8 @@ void handleForwardData(String msg, int relayRssi, float relaySnr) {
   data.gpsValid = getField(msg, 9).toInt();
   data.runnerRssi = getField(msg, 10).toInt();
   data.runnerSnr = getField(msg, 11).toFloat();
+  data.relayRssi = relayRssi;
+  data.relaySnr = relaySnr;
 
   Serial.println("Runner 데이터 수신");
   Serial.print("  Relay ID: ");
@@ -353,9 +473,9 @@ void handleForwardData(String msg, int relayRssi, float relaySnr) {
   Serial.print(" / ");
   Serial.println(data.runnerSnr, 2);
   Serial.print("  Relay->Gateway RSSI/SNR: ");
-  Serial.print(relayRssi);
+  Serial.print(data.relayRssi);
   Serial.print(" / ");
-  Serial.println(relaySnr, 2);
+  Serial.println(data.relaySnr, 2);
 
   changeState(WAIT_FORWARD_DONE);
 }
@@ -366,7 +486,9 @@ void handleForwardDone(String msg) {
   int reportedCount = getField(msg, 3).toInt();
 
   if (packetCycleId != currentCycleId || relayId != currentRelayId) {
-    if (SHOW_DEBUG_LOG) Serial.println("무시: cycle 또는 relay 불일치");
+    if (SHOW_DEBUG_LOG) {
+      Serial.println("무시: cycle 또는 relay 불일치");
+    }
     return;
   }
 
@@ -375,6 +497,7 @@ void handleForwardDone(String msg) {
   Serial.println(reportedCount);
   Serial.print("  Gateway 수신 개수: ");
   Serial.println(forwardCount);
+
   if (reportedCount != forwardCount) {
     Serial.println("경고: Relay 보고 개수와 Gateway 수신 개수가 다릅니다.");
   }
@@ -422,6 +545,29 @@ void handleEmergencyForward(String msg) {
   Serial.println(snr, 2);
   Serial.println("===================================");
 
+  String emergencyMsg = "EMERGENCY_FORWARD,";
+  emergencyMsg += String(emergencyId);
+  emergencyMsg += ",";
+  emergencyMsg += String(relayId);
+  emergencyMsg += ",";
+  emergencyMsg += String(runnerId);
+  emergencyMsg += ",";
+  emergencyMsg += lat;
+  emergencyMsg += ",";
+  emergencyMsg += lng;
+  emergencyMsg += ",";
+  emergencyMsg += String(battery);
+  emergencyMsg += ",";
+  emergencyMsg += timestamp;
+  emergencyMsg += ",";
+  emergencyMsg += String(gpsValid);
+  emergencyMsg += ",";
+  emergencyMsg += String(rssi);
+  emergencyMsg += ",";
+  emergencyMsg += String(snr, 2);
+
+  mqttPublish(MQTT_TOPIC_EMERGENCY, emergencyMsg);
+
   showOLED("!!! EMERGENCY !!!",
            "Runner " + String(runnerId),
            "Relay " + String(relayId),
@@ -440,6 +586,7 @@ void printAndSendCycleData() {
 
   for (int i = 0; i < forwardCount; i++) {
     ForwardData &data = forwardBuffer[i];
+
     Serial.print("  Runner ");
     Serial.print(data.runnerId);
     Serial.print(" -> 위도=");
@@ -450,7 +597,8 @@ void printAndSendCycleData() {
     Serial.print(data.pace);
     Serial.print(", 배터리=");
     Serial.println(data.battery);
-    sendToServerStub(data);
+
+    sendToServer(data);
   }
 
   showOLED("Gateway " + String(GATEWAY_ID),
@@ -459,25 +607,49 @@ void printAndSendCycleData() {
            "Ch " + String(currentChannelId));
 }
 
-void sendToServerStub(ForwardData data) {
-  if (SHOW_DEBUG_LOG) {
-    Serial.print("서버 전송 준비: relay=");
-    Serial.print(data.relayId);
-    Serial.print(", runner=");
-    Serial.println(data.runnerId);
-  }
+void sendToServer(ForwardData data) {
+  String msg = "FORWARD_DATA,";
+  msg += String(data.cycleId);
+  msg += ",";
+  msg += String(data.relayId);
+  msg += ",";
+  msg += String(data.runnerId);
+  msg += ",";
+  msg += data.lat;
+  msg += ",";
+  msg += data.lng;
+  msg += ",";
+  msg += String(data.pace);
+  msg += ",";
+  msg += String(data.battery);
+  msg += ",";
+  msg += String(data.seq);
+  msg += ",";
+  msg += String(data.gpsValid);
+  msg += ",";
+  msg += String(data.runnerRssi);
+  msg += ",";
+  msg += String(data.runnerSnr, 2);
+  msg += ",";
+  msg += String(data.relayRssi);
+  msg += ",";
+  msg += String(data.relaySnr, 2);
+
+  mqttPublish(MQTT_TOPIC_DATA, msg);
 }
 
 void changeState(GatewayState nextState) {
   if (currentState == nextState) {
     return;
   }
+
   if (SHOW_STATE_LOG) {
     Serial.print("상태 변경: ");
     Serial.print(stateName(currentState));
     Serial.print(" -> ");
     Serial.println(stateName(nextState));
   }
+
   currentState = nextState;
   stateStartTime = millis();
 }
@@ -493,5 +665,6 @@ const char *stateName(GatewayState state) {
     case PRINT_OR_SEND_TO_SERVER:
       return "PRINT_OR_SEND_TO_SERVER";
   }
+
   return "UNKNOWN";
 }
